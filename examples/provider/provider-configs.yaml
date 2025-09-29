@@ -1,0 +1,37 @@
+apiVersion: pkg.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: default
+spec:
+  # Default configuration for Kubernetes Service Account auth (in-cluster)
+  credentials:
+    source: "ServiceAccount"
+  
+  # Default registry auth (can be overridden per resource)
+  defaultRegistryAuth:
+    ghcr.io: "github-registry-secret"
+    registry1.dso.mil: "ironbank-registry-secret"
+  
+  # Default timeout for operations
+  defaultTimeout: "15m"
+---
+apiVersion: pkg.crossplane.io/v1alpha1  
+kind: ProviderConfig
+metadata:
+  name: production
+spec:
+  # Production configuration with stricter settings
+  credentials:
+    source: "Secret"
+    secretRef:
+      namespace: "crossplane-system"
+      name: "zarf-provider-creds"
+      key: "kubeconfig"
+  
+  # Production registry auth
+  defaultRegistryAuth:
+    registry1.dso.mil: "prod-ironbank-creds"
+    ghcr.io: "prod-github-creds"
+  
+  # Longer timeout for complex packages  
+  defaultTimeout: "30m"

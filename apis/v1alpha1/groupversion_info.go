@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package v1alpha1 contains the core resources of the Zarf provider.
 // +kubebuilder:object:generate=true
-// +groupName=zarf.crossplane.io
+// +groupName=zarf.dev
 // +versionName=v1alpha1
 package v1alpha1
 
@@ -27,7 +27,7 @@ import (
 
 // Package type metadata.
 const (
-	Group   = "zarf.crossplane.io"
+	Group   = "zarf.dev"
 	Version = "v1alpha1"
 )
 

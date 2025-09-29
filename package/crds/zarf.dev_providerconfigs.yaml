@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.0
-  name: providerconfigs.zarf.crossplane.io
+  name: providerconfigs.zarf.dev
 spec:
-  group: zarf.crossplane.io
+  group: zarf.dev
   names:
     kind: ProviderConfig
     listKind: ProviderConfigList

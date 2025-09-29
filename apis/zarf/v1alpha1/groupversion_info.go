@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package v1alpha1 contains the v1alpha1 group Sample resources of the Zarf provider.
+// Package v1alpha1 contains the v1alpha1 group ZarfPackage resources of the Zarf provider.
 // +kubebuilder:object:generate=true
-// +groupName=zarf.zarf.crossplane.io
+// +groupName=zarf.dev
 // +versionName=v1alpha1
 package v1alpha1
 
@@ -27,7 +27,7 @@ import (
 
 // Package type metadata.
 const (
-	Group   = "zarf.zarf.crossplane.io"
+	Group   = "zarf.dev"
 	Version = "v1alpha1"
 )
 

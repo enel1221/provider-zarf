@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.0
-  name: storeconfigs.zarf.crossplane.io
+  name: storeconfigs.zarf.dev
 spec:
-  group: zarf.crossplane.io
+  group: zarf.dev
   names:
     categories:
     - crossplane

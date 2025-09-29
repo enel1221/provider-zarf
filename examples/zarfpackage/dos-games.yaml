@@ -1,0 +1,34 @@
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: dos-games-example
+  namespace: default
+spec:
+  forProvider:
+    # Source OCI reference - this is the only required field
+    source: "oci://defenseunicorns/packages/dos-games:1.0.0"
+    
+    # Optional fields from zarf-operator - all preserved per requirements
+    namespace: "games"
+    components:
+      - "dos-games"
+    variables:
+      GAME_COUNT: "3"
+    timeout: 
+      duration: "15m"
+    retries: 3
+    adoptExistingResources: true
+    skipSignatureValidation: false
+    plainHTTP: false
+    insecureSkipTLSVerify: false
+  
+  # Crossplane management policies
+  managementPolicies:
+    - "Create"
+    - "Update" 
+    - "Delete"
+    - "Observe"
+  
+  # Provider config reference
+  providerConfigRef:
+    name: default

@@ -1,0 +1,38 @@
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: big-bang-core
+  namespace: default
+spec:
+  forProvider:
+    # Source OCI reference for Big Bang Core package
+    source: "oci://registry1.dso.mil/ironbank/big-bang/bigbang:2.34.0"
+    
+    # Deploy to bigbang namespace
+    namespace: "bigbang"
+    
+    # Select specific components
+    components:
+      - "istio-controlplane"
+      - "istio-operator" 
+      - "monitoring"
+      - "kiali"
+      
+    # Configure variables for production deployment
+    variables:
+      DOMAIN: "bigbang.local"
+      ISTIO_INJECTION: "enabled"
+      
+    # Production timeouts and settings
+    timeout:
+      duration: "30m"
+    retries: 5
+    adoptExistingResources: true
+    skipSignatureValidation: false
+    
+  # Observe-only for existing deployment validation
+  managementPolicies:
+    - "Observe"
+  
+  providerConfigRef:
+    name: production
