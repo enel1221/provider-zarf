@@ -1,0 +1,27 @@
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-zarf-runtime
+spec:
+  deploymentTemplate:
+    metadata:
+      labels:
+        zarf.dev/agent: ignore
+    spec:
+      selector:
+        matchLabels:
+          pkg.crossplane.io/provider: ""
+      template:
+        metadata:
+          labels:
+            zarf.dev/agent: ignore
+        spec:
+          containers:
+          - name: package-runtime
+            env:
+            - name: ZARF_BYPASS
+              value: "true"
+  serviceTemplate:
+    metadata:
+      labels:
+        zarf.dev/agent: ignore

@@ -1,0 +1,8 @@
+apiVersion: zarf.dev/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: default
+spec:
+  # Use InjectedIdentity for in-cluster authentication (most common for providers)
+  credentials:
+    source: InjectedIdentity
