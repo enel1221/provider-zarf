@@ -207,9 +207,11 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 	}
 
-	packageName := xpmeta.GetExternalName(cr)
+	// Always use the package name extracted from the source, not the external name
+	packageName := extractPackageName(cr.Spec.ForProvider.Source)
 	if packageName == "" {
-		packageName = extractPackageName(cr.Spec.ForProvider.Source)
+		// Fallback to external name if we can't extract from source
+		packageName = xpmeta.GetExternalName(cr)
 	}
 
 	observeCtx := ctrllog.IntoContext(ctx, c.logger.
@@ -222,12 +224,18 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 
 	if !installed {
+		cr.Status.SetConditions(xpv1.Unavailable())
+		cr.Status.AtProvider.Phase = "NotInstalled" 
+		cr.Status.AtProvider.PackageName = packageName
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	// The package is installed. We'll consider it "up-to-date" for now.
-	// A more sophisticated implementation could check the package version or
-	// other details to determine if an update is needed.
+	// The package is installed. Set the correct external name and status.
+	// This ensures Crossplane knows the actual Zarf package name for future operations.
+	if existing := xpmeta.GetExternalName(cr); existing != packageName {
+		xpmeta.SetExternalName(cr, packageName)
+	}
+	
 	cr.Status.SetConditions(v1.Available())
 	cr.Status.AtProvider.Phase = "Installed"
 	cr.Status.AtProvider.PackageName = packageName
@@ -248,6 +256,29 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	c.logger.Info("Create method called", "source", cr.Spec.ForProvider.Source)
 
+	// First check if the package already exists - if so, just set external name and return
+	packageName := extractPackageName(cr.Spec.ForProvider.Source)
+	if packageName == "" {
+		packageName = xpmeta.GetExternalName(cr)
+	}
+	
+	installed, _, err := c.client.IsInstalled(ctx, packageName, cr.Spec.ForProvider.Namespace)
+	if err != nil {
+		return managed.ExternalCreation{}, errors.Wrap(err, "failed to check if package is already installed")
+	}
+	
+	if installed {
+		c.logger.Info("Package already exists, setting external name and status", "packageName", packageName)
+		if existing := xpmeta.GetExternalName(cr); existing != packageName {
+			xpmeta.SetExternalName(cr, packageName)
+		}
+		cr.Status.AtProvider.PackageName = packageName
+		cr.Status.AtProvider.Phase = "Installed"
+		cr.Status.SetConditions(v1.Available())
+		return managed.ExternalCreation{}, nil
+	}
+
+	c.logger.Info("Package not found, proceeding with deployment", "packageName", packageName)
 	cr.Status.SetConditions(v1.Creating())
 	cr.Status.AtProvider.Phase = "Installing"
 
@@ -287,9 +318,9 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	c.logger.Info("zarfclient.Deploy completed successfully", "packageName", result.PackageName)
 
-	packageName := result.PackageName
-	if packageName == "" {
-		packageName = extractPackageName(cr.Spec.ForProvider.Source)
+	// Use the package name from deployment result, or fallback to extracted name
+	if result.PackageName != "" {
+		packageName = result.PackageName
 	}
 
 	// Set external name in memory for Crossplane to detect and persist automatically
@@ -301,6 +332,9 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr.Status.AtProvider.PackageName = packageName
 	cr.Status.AtProvider.Phase = "Installed"
 	cr.Status.SetConditions(v1.Available())
+
+	// Add a small delay to avoid rate limiting after deployment
+	time.Sleep(2 * time.Second)
 
 	return managed.ExternalCreation{}, nil
 }

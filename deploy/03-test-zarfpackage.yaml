@@ -1,7 +1,7 @@
 apiVersion: zarf.dev/v1alpha1
 kind: ZarfPackage
 metadata:
-  name: test-podinfo-flux
+  name: podinfo-flux
   namespace: default
 spec:
   forProvider:
