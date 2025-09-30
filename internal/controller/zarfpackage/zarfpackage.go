@@ -54,6 +54,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -70,7 +71,6 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/statemetrics"
 
-	v1 "github.com/crossplane/provider-zarf/apis/common/v1"
 	apisv1alpha1 "github.com/crossplane/provider-zarf/apis/v1alpha1"
 	"github.com/crossplane/provider-zarf/apis/zarf/v1alpha1"
 	"github.com/crossplane/provider-zarf/internal/zarfclient"
@@ -224,7 +224,22 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 
 	if !installed {
-		cr.Status.SetConditions(xpv1.Unavailable())
+		cr.Status.SetConditions(
+			xpv1.Condition{
+				Type:               xpv1.TypeReady,
+				Status:             corev1.ConditionFalse,
+				Reason:             "NotInstalled",
+				Message:            "Zarf package is not installed",
+				LastTransitionTime: metav1.Now(),
+			},
+			xpv1.Condition{
+				Type:               xpv1.TypeSynced,
+				Status:             corev1.ConditionTrue,
+				Reason:             "ReconcileSuccess",
+				Message:            "Successfully checked package status",
+				LastTransitionTime: metav1.Now(),
+			},
+		)
 		cr.Status.AtProvider.Phase = "NotInstalled" 
 		cr.Status.AtProvider.PackageName = packageName
 		return managed.ExternalObservation{ResourceExists: false}, nil
@@ -236,7 +251,22 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		xpmeta.SetExternalName(cr, packageName)
 	}
 	
-	cr.Status.SetConditions(v1.Available())
+	cr.Status.SetConditions(
+		xpv1.Condition{
+			Type:               xpv1.TypeReady,
+			Status:             corev1.ConditionTrue,
+			Reason:             "Available",
+			Message:            "Zarf package is deployed and ready",
+			LastTransitionTime: metav1.Now(),
+		},
+		xpv1.Condition{
+			Type:               xpv1.TypeSynced,
+			Status:             corev1.ConditionTrue,
+			Reason:             "ReconcileSuccess",
+			Message:            "Successfully reconciled Zarf package",
+			LastTransitionTime: metav1.Now(),
+		},
+	)
 	cr.Status.AtProvider.Phase = "Installed"
 	cr.Status.AtProvider.PackageName = packageName
 
@@ -274,12 +304,27 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		}
 		cr.Status.AtProvider.PackageName = packageName
 		cr.Status.AtProvider.Phase = "Installed"
-		cr.Status.SetConditions(v1.Available())
+		cr.Status.SetConditions(
+			xpv1.Condition{
+				Type:               xpv1.TypeReady,
+				Status:             corev1.ConditionTrue,
+				Reason:             "Available",
+				Message:            "Zarf package is deployed and ready",
+				LastTransitionTime: metav1.Now(),
+			},
+			xpv1.Condition{
+				Type:               xpv1.TypeSynced,
+				Status:             corev1.ConditionTrue,
+				Reason:             "ReconcileSuccess",
+				Message:            "Successfully reconciled Zarf package",
+				LastTransitionTime: metav1.Now(),
+			},
+		)
 		return managed.ExternalCreation{}, nil
 	}
 
 	c.logger.Info("Package not found, proceeding with deployment", "packageName", packageName)
-	cr.Status.SetConditions(v1.Creating())
+	cr.Status.SetConditions(xpv1.Creating())
 	cr.Status.AtProvider.Phase = "Installing"
 
 	deployTimeout := 30 * time.Minute
@@ -331,7 +376,22 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	// Set status in memory - Crossplane will persist it
 	cr.Status.AtProvider.PackageName = packageName
 	cr.Status.AtProvider.Phase = "Installed"
-	cr.Status.SetConditions(v1.Available())
+	cr.Status.SetConditions(
+		xpv1.Condition{
+			Type:               xpv1.TypeReady,
+			Status:             corev1.ConditionTrue,
+			Reason:             "Available",
+			Message:            "Zarf package is deployed and ready",
+			LastTransitionTime: metav1.Now(),
+		},
+		xpv1.Condition{
+			Type:               xpv1.TypeSynced,
+			Status:             corev1.ConditionTrue,
+			Reason:             "ReconcileSuccess",
+			Message:            "Successfully reconciled Zarf package",
+			LastTransitionTime: metav1.Now(),
+		},
+	)
 
 	// Add a small delay to avoid rate limiting after deployment
 	time.Sleep(2 * time.Second)
