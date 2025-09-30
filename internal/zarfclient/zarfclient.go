@@ -207,27 +207,44 @@ func New() Client {
 	return &client{}
 }
 
-// IsInstalled returns true if a deployed package secret already exists matching the provided source/package name.
-// Source can be an OCI ref or a plain package name. We only treat plain names as already-installed lookups (cluster type).
+// IsInstalled returns true if a deployed package secret already exists.
+// This is simplified to match the proven Kubebuilder implementation.
+// For OCI sources, we extract the package name and check if it exists in cluster state.
 func (c *client) IsInstalled(ctx context.Context, src string, namespaceOverride string) (bool, *state.DeployedPackage, error) {
 	name, isClusterName := inferClusterPackageName(src)
-	if !isClusterName {
-		// For OCI / tar / http sources we cannot conclude installation without deeper inspection.
-		// Simplest: attempt lookup by inferred package metadata name after optional load metadata.
-		// Optimization: Return false; actual duplicate prevention occurs after first deploy when user switches to name.
-		return false, nil, nil
-	}
-	cl, err := cluster.New(ctx)
+
+	// Bridge controller-runtime logger into Zarf slog logger for consistent log output
+	ctrlLogger := ctrllog.FromContext(ctx).WithName("zarf-isinstalled")
+	bridge := &logrSlogBridge{logger: ctrlLogger}
+	slogLogger := slog.New(slog.NewJSONHandler(bridge, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	observeCtx := logger.WithContext(ctx, slogLogger)
+	zlog := logger.From(observeCtx)
+
+	cl, err := cluster.New(observeCtx)
 	if err != nil {
 		return false, nil, err
 	}
-	dep, err := cl.GetDeployedPackage(ctx, name, state.WithPackageNamespaceOverride(namespaceOverride))
+
+	if !isClusterName {
+		// For OCI/tar/http sources, extract likely package name from source
+		// This follows the same pattern as the Kubebuilder controller
+		name = extractPackageNameFromSource(normalizeSource(src))
+		zlog.Debug("zarfclient: extracted package name from OCI source", "source", src, "extractedName", name)
+	}
+
+	// Simple direct lookup - same as Kubebuilder controller
+	dep, err := cl.GetDeployedPackage(observeCtx, name, state.WithPackageNamespaceOverride(namespaceOverride))
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
+			zlog.Debug("zarfclient: package not found in cluster state", "packageName", name)
 			return false, nil, nil
 		}
+		zlog.Debug("zarfclient: error checking package installation", "packageName", name, "error", err)
 		return false, nil, err
 	}
+
+	zlog.Debug("zarfclient: package found in cluster state", "packageName", name)
 	return true, dep, nil
 }
 
@@ -320,18 +337,24 @@ func (c *client) Deploy(ctx context.Context, opts DeployOptions) (Result, error)
 		deployOpts.Timeout = 30 * time.Minute
 	}
 
-	// Pre-establish cluster connection with extended timeout
-	// The Zarf library uses a 30-second hardcoded timeout internally, so we establish
-	// the connection first with our full deployment timeout to avoid premature failures
-	clusterCtx, clusterCancel := context.WithTimeout(deployCtx, deployOpts.Timeout)
+	// Pre-establish cluster connection with reasonable timeout
+	// Use a shorter timeout for cluster connection to avoid hanging
+	clusterConnectTimeout := 2 * time.Minute
+	if deployOpts.Timeout < clusterConnectTimeout {
+		clusterConnectTimeout = deployOpts.Timeout / 2
+	}
+
+	clusterCtx, clusterCancel := context.WithTimeout(deployCtx, clusterConnectTimeout)
 	defer clusterCancel()
 
-	_, clusterErr := cluster.NewWithWait(clusterCtx)
+	// Use cluster.New() instead of NewWithWait() to avoid waiting for full cluster readiness
+	// This is faster and more appropriate for provider context
+	_, clusterErr := cluster.New(clusterCtx)
 	if clusterErr != nil {
-		l.Error("zarfclient: cluster connection failed", "error", clusterErr, "timeout", deployOpts.Timeout)
+		l.Error("zarfclient: cluster connection failed", "error", clusterErr, "connectTimeout", clusterConnectTimeout, "deployTimeout", deployOpts.Timeout)
 		return Result{}, fmt.Errorf("cluster connection: %w", clusterErr)
 	}
-	l.Debug("zarfclient: cluster connection established")
+	l.Debug("zarfclient: cluster connection established", "connectTimeout", clusterConnectTimeout)
 
 	l.Info("zarfclient: starting packager.Deploy", "timeout", deployOpts.Timeout)
 	// Use the context with logger for the actual deployment
@@ -415,4 +438,34 @@ func normalizeSource(src string) string {
 		return src
 	}
 	return ociPrefix + src
+}
+
+// extractPackageNameFromSource attempts to extract a likely package name from an OCI source
+// Example: "oci://ghcr.io/enel1221/zarf-operator/podinfo-flux:0.1.0" -> "podinfo-flux"
+func extractPackageNameFromSource(source string) string {
+	if source == "" {
+		return ""
+	}
+
+	// Remove oci:// prefix if present
+	clean := strings.TrimPrefix(source, ociPrefix)
+
+	// Split by / and take the last part (image name)
+	parts := strings.Split(clean, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	imageName := parts[len(parts)-1]
+
+	// Remove tag or digest if present
+	// Handle both :tag and @digest formats
+	if idx := strings.LastIndex(imageName, ":"); idx != -1 {
+		imageName = imageName[:idx]
+	}
+	if idx := strings.LastIndex(imageName, "@"); idx != -1 {
+		imageName = imageName[:idx]
+	}
+
+	return imageName
 }

@@ -39,6 +39,13 @@ limitations under the License.
 //     package.
 package zarfpackage
 
+// Zarf Provider RBAC requirements
+// Zarf needs cluster-admin permissions to deploy any type of Kubernetes resource
+// Similar to ArgoCD, Flux, or other GitOps operators that need to manage arbitrary resources
+//
+//+kubebuilder:rbac:groups=*,resources=*,verbs=*
+//+kubebuilder:rbac:urls=*,verbs=*
+
 import (
 	"context"
 	"strings"
@@ -57,6 +64,7 @@ import (
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	xpmeta "github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
@@ -171,7 +179,9 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	return &external{
 		client: svc,
 		kube:   c.kube,
-		logger: logr.New(ctrllog.NullLogSink{}),
+		logger: ctrllog.FromContext(ctx).
+			WithName("zarfpackage-external").
+			WithValues("name", cr.GetName(), "namespace", cr.GetNamespace()),
 	}, nil
 }
 
@@ -197,7 +207,16 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 	}
 
-	installed, _, err := c.client.IsInstalled(ctx, cr.Spec.ForProvider.Source, cr.Spec.ForProvider.Namespace)
+	packageName := xpmeta.GetExternalName(cr)
+	if packageName == "" {
+		packageName = extractPackageName(cr.Spec.ForProvider.Source)
+	}
+
+	observeCtx := ctrllog.IntoContext(ctx, c.logger.
+		WithName("zarf-observe").
+		WithValues("source", cr.Spec.ForProvider.Source, "packageName", packageName))
+
+	installed, _, err := c.client.IsInstalled(observeCtx, packageName, cr.Spec.ForProvider.Namespace)
 	if err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "failed to check if package is installed")
 	}
@@ -211,6 +230,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	// other details to determine if an update is needed.
 	cr.Status.SetConditions(v1.Available())
 	cr.Status.AtProvider.Phase = "Installed"
+	cr.Status.AtProvider.PackageName = packageName
 
 	return managed.ExternalObservation{
 		ResourceExists:    true,
@@ -226,12 +246,14 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, errors.New(errNotZarfPackage)
 	}
 
+	c.logger.Info("Create method called", "source", cr.Spec.ForProvider.Source)
+
 	cr.Status.SetConditions(v1.Creating())
 	cr.Status.AtProvider.Phase = "Installing"
 
-	var timeout *time.Duration
-	if cr.Spec.ForProvider.Timeout != nil {
-		timeout = &cr.Spec.ForProvider.Timeout.Duration
+	deployTimeout := 30 * time.Minute
+	if cr.Spec.ForProvider.Timeout != nil && cr.Spec.ForProvider.Timeout.Duration > 0 {
+		deployTimeout = cr.Spec.ForProvider.Timeout.Duration
 	}
 
 	opts := zarfclient.DeployOptions{
@@ -241,19 +263,44 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		Variables:               cr.Spec.ForProvider.Variables,
 		Architecture:            cr.Spec.ForProvider.Architecture,
 		Retries:                 cr.Spec.ForProvider.Retries,
-		Timeout:                 timeout,
+		Timeout:                 &deployTimeout,
 		AdoptExisting:           cr.Spec.ForProvider.AdoptExistingResources,
 		SkipSignatureValidation: cr.Spec.ForProvider.SkipSignatureValidation,
 		PlainHTTP:               cr.Spec.ForProvider.PlainHTTP,
 		InsecureSkipTLSVerify:   cr.Spec.ForProvider.InsecureSkipTLSVerify,
 	}
 
-	// Inject logger into context for Zarf library integration
-	deployCtx := ctrllog.IntoContext(ctx, c.logger.WithName("zarf-deploy"))
+	c.logger.Info("About to call zarfclient.Deploy", "timeout", deployTimeout)
 
-	if _, err := c.client.Deploy(deployCtx, opts); err != nil {
+	// Inject logger into context for Zarf library integration
+	deployLogger := c.logger.WithName("zarf-deploy").WithValues("source", cr.Spec.ForProvider.Source)
+	baseCtx := context.WithoutCancel(ctx)
+	deployCtx, cancel := context.WithTimeout(baseCtx, deployTimeout)
+	defer cancel()
+	deployCtx = ctrllog.IntoContext(deployCtx, deployLogger)
+
+	result, err := c.client.Deploy(deployCtx, opts)
+	if err != nil {
+		c.logger.Error(err, "zarfclient.Deploy failed")
 		return managed.ExternalCreation{}, errors.Wrap(err, "failed to deploy package")
 	}
+
+	c.logger.Info("zarfclient.Deploy completed successfully", "packageName", result.PackageName)
+
+	packageName := result.PackageName
+	if packageName == "" {
+		packageName = extractPackageName(cr.Spec.ForProvider.Source)
+	}
+
+	// Set external name in memory for Crossplane to detect and persist automatically
+	if existing := xpmeta.GetExternalName(cr); existing != packageName {
+		xpmeta.SetExternalName(cr, packageName)
+	}
+
+	// Set status in memory - Crossplane will persist it
+	cr.Status.AtProvider.PackageName = packageName
+	cr.Status.AtProvider.Phase = "Installed"
+	cr.Status.SetConditions(v1.Available())
 
 	return managed.ExternalCreation{}, nil
 }
@@ -276,10 +323,13 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr.Status.SetConditions(xpv1.Deleting())
 	cr.Status.AtProvider.Phase = "Removing"
 
-	packageName := extractPackageName(cr.Spec.ForProvider.Source)
+	packageName := xpmeta.GetExternalName(cr)
+	if packageName == "" {
+		packageName = extractPackageName(cr.Spec.ForProvider.Source)
+	}
 
 	// Inject logger into context for Zarf library integration
-	removeCtx := ctrllog.IntoContext(ctx, c.logger.WithName("zarf-remove"))
+	removeCtx := ctrllog.IntoContext(ctx, c.logger.WithName("zarf-remove").WithValues("source", cr.Spec.ForProvider.Source))
 
 	if err := c.client.Remove(removeCtx, packageName, cr.Spec.ForProvider.Namespace); err != nil {
 		return managed.ExternalDelete{}, errors.Wrap(err, "failed to remove package")

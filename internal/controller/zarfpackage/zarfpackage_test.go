@@ -27,10 +27,19 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/crossplane/provider-zarf/apis/zarf/v1alpha1"
 	"github.com/crossplane/provider-zarf/internal/zarfclient"
 )
+
+var testScheme = runtime.NewScheme()
+
+func init() {
+	_ = v1alpha1.SchemeBuilder.AddToScheme(testScheme)
+}
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing
 // libraries, per the common Go test review comments. Crossplane encourages the
@@ -73,6 +82,7 @@ func TestObserve(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				mg: &v1alpha1.ZarfPackage{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
 					Spec: v1alpha1.ZarfPackageSpec{
 						ForProvider: v1alpha1.ZarfPackageParameters{
 							Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
@@ -98,6 +108,7 @@ func TestObserve(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				mg: &v1alpha1.ZarfPackage{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
 					Spec: v1alpha1.ZarfPackageSpec{
 						ForProvider: v1alpha1.ZarfPackageParameters{
 							Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
@@ -125,6 +136,7 @@ func TestObserve(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				mg: &v1alpha1.ZarfPackage{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
 					Spec: v1alpha1.ZarfPackageSpec{
 						ForProvider: v1alpha1.ZarfPackageParameters{
 							Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
@@ -140,8 +152,14 @@ func TestObserve(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			e := external{client: tc.fields.client}
-			got, err := e.Observe(tc.args.ctx, tc.args.mg)
+			pkg, ok := tc.args.mg.(*v1alpha1.ZarfPackage)
+			if !ok {
+				t.Fatalf("test managed resource is not *v1alpha1.ZarfPackage")
+			}
+			existing := pkg.DeepCopy()
+			fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithStatusSubresource(&v1alpha1.ZarfPackage{}).WithObjects(existing).Build()
+			e := external{client: tc.fields.client, kube: fakeClient}
+			got, err := e.Observe(tc.args.ctx, pkg)
 			switch {
 			case tc.want.err != nil && err == nil:
 				t.Errorf("\n%s\ne.Observe(...): expected error but got nil\n", tc.reason)
@@ -190,6 +208,7 @@ func TestCreate(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				mg: &v1alpha1.ZarfPackage{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
 					Spec: v1alpha1.ZarfPackageSpec{
 						ForProvider: v1alpha1.ZarfPackageParameters{
 							Source:     "oci://defenseunicorns/packages/dos-games:1.0.0",
@@ -218,6 +237,7 @@ func TestCreate(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				mg: &v1alpha1.ZarfPackage{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
 					Spec: v1alpha1.ZarfPackageSpec{
 						ForProvider: v1alpha1.ZarfPackageParameters{
 							Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
@@ -233,8 +253,14 @@ func TestCreate(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			e := external{client: tc.fields.client}
-			got, err := e.Create(tc.args.ctx, tc.args.mg)
+			pkg, ok := tc.args.mg.(*v1alpha1.ZarfPackage)
+			if !ok {
+				t.Fatalf("test managed resource is not *v1alpha1.ZarfPackage")
+			}
+			existing := pkg.DeepCopy()
+			fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithStatusSubresource(&v1alpha1.ZarfPackage{}).WithObjects(existing).Build()
+			e := external{client: tc.fields.client, kube: fakeClient}
+			got, err := e.Create(tc.args.ctx, pkg)
 			switch {
 			case tc.want.err != nil && err == nil:
 				t.Errorf("\n%s\ne.Create(...): expected error but got nil\n", tc.reason)

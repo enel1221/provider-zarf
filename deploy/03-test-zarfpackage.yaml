@@ -1,0 +1,14 @@
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: test-podinfo-flux
+  namespace: default
+spec:
+  forProvider:
+    source: oci://ghcr.io/enel1221/zarf-operator/podinfo-flux:0.1.0
+    architecture: arm64
+    variables:
+      PODINFO_IMAGE: "ghcr.io/stefanprodan/podinfo:6.4.0"
+      FLUX_VERSION: "v2.1.2"
+  providerConfigRef:
+    name: default

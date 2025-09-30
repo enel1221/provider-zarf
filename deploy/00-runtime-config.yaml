@@ -18,9 +18,32 @@ spec:
         spec:
           containers:
           - name: package-runtime
+            args: ["--debug"]
             env:
             - name: ZARF_BYPASS
               value: "true"
+            # Enable debug logging for Crossplane provider
+            - name: CROSSPLANE_DEBUG
+              value: "true"
+            - name: CROSSPLANE_LOG_LEVEL
+              value: "debug"
+            # Enable detailed Zarf logging  
+            - name: ZARF_LOG_LEVEL
+              value: "debug"
+            volumeMounts:
+            - name: tmp-storage
+              mountPath: /tmp
+            - name: zarf-cache
+              mountPath: /home/nonroot/.cache/zarf
+            - name: images-storage
+              mountPath: /images
+          volumes:
+          - name: tmp-storage
+            emptyDir: {}
+          - name: zarf-cache
+            emptyDir: {}
+          - name: images-storage
+            emptyDir: {}
   serviceTemplate:
     metadata:
       labels:

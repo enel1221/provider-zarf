@@ -5,8 +5,8 @@ metadata:
   labels:
     zarf.dev/agent: ignore
 spec:
-  package: ghcr.io/enel1221/provider-zarf:v0.0.5
-  packagePullPolicy: IfNotPresent
+  package: ghcr.io/enel1221/provider-zarf:v0.0.14
+  packagePullPolicy: Always
   runtimeConfigRef:
     apiVersion: pkg.crossplane.io/v1beta1
     kind: DeploymentRuntimeConfig
