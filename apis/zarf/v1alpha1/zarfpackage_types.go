@@ -117,6 +117,23 @@ type ZarfPackageObservation struct {
 
 	// PackageName is the name of the deployed Zarf package.
 	PackageName string `json:"packageName,omitempty"`
+
+	// ConsecutiveFailures tracks how many times in a row the deployment has failed.
+	// This is used to drive circuit breaker behaviour so that persistent failures
+	// do not result in hot looping reconciliation.
+	ConsecutiveFailures int64 `json:"consecutiveFailures,omitempty"`
+
+	// CircuitBreakerActive indicates whether the controller has paused reconcile
+	// attempts due to repeated failures. It automatically resets after a cooldown
+	// period.
+	CircuitBreakerActive bool `json:"circuitBreakerActive,omitempty"`
+
+	// LastFailureTime is the timestamp for the most recent deployment failure.
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+
+	// LastFailureMessage is a short, user-facing explanation of the most recent
+	// failure that triggered a retry or circuit breaker event.
+	LastFailureMessage string `json:"lastFailureMessage,omitempty"`
 }
 
 // A ZarfPackageSpec defines the desired state of a ZarfPackage.
@@ -131,23 +148,13 @@ type ZarfPackageStatus struct {
 	AtProvider          ZarfPackageObservation `json:"atProvider,omitempty"`
 }
 
-// GetConditions returns the resource's conditions.
-func (s *ZarfPackageStatus) GetConditions() []xpv1.Condition {
-	return s.Conditions
-}
-
-// SetConditions sets the resource's conditions.
-func (s *ZarfPackageStatus) SetConditions(c ...xpv1.Condition) {
-	s.Conditions = c
-}
-
 // +kubebuilder:object:root=true
 
 // A ZarfPackage is a managed resource that represents a Zarf package.
 // It allows you to declaratively manage the deployment of Zarf packages in a Kubernetes cluster.
 // +kubebuilder:printcolumn:name="READY",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="SYNCED",type="string",JSONPath=".status.conditions[?(@.type=='Synced')].status"
-// +kubebuilder:printcolumn:name="EXTERNAL-NAME",type="string",JSONPath=".metadata.annotations.crossplane\\.io/external-name"
+// +kubebuilder:printcolumn:name="EXTERNAL-NAME",type="string",JSONPath=".metadata.annotations['crossplane.io/external-name']"
 // +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,categories={crossplane,managed,zarf}

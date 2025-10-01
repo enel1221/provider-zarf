@@ -21,15 +21,19 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"github.com/zarf-dev/zarf/src/pkg/state"
 
+	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/crossplane/provider-zarf/apis/zarf/v1alpha1"
 	"github.com/crossplane/provider-zarf/internal/zarfclient"
@@ -39,6 +43,16 @@ var testScheme = runtime.NewScheme()
 
 func init() {
 	_ = v1alpha1.SchemeBuilder.AddToScheme(testScheme)
+}
+
+// newExternalForTest creates an external client with all required fields for testing.
+func newExternalForTest(zarfClient zarfclient.Client, kubeClient client.Client) *external {
+	return &external{
+		client:   zarfClient,
+		kube:     kubeClient,
+		logger:   logr.New(&log.NullLogSink{}),
+		recorder: event.NewNopRecorder(),
+	}
 }
 
 // Unlike many Kubernetes projects Crossplane does not use third party testing
@@ -158,7 +172,7 @@ func TestObserve(t *testing.T) {
 			}
 			existing := pkg.DeepCopy()
 			fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithStatusSubresource(&v1alpha1.ZarfPackage{}).WithObjects(existing).Build()
-			e := external{client: tc.fields.client, kube: fakeClient}
+			e := newExternalForTest(tc.fields.client, fakeClient)
 			got, err := e.Observe(tc.args.ctx, pkg)
 			switch {
 			case tc.want.err != nil && err == nil:
@@ -196,11 +210,12 @@ func TestCreate(t *testing.T) {
 		args   args
 		want   want
 	}{
-		"SuccessfulDeploy": {
-			reason: "Should successfully deploy package",
+		"SuccessfulLaunch": {
+			reason: "Should successfully launch deployment in background",
 			fields: fields{
 				client: &zarfclient.MockClient{
 					MockDeploy: func(ctx context.Context, opts zarfclient.DeployOptions) (zarfclient.Result, error) {
+						// This will be called in background, so we don't test it here
 						return zarfclient.Result{PackageName: "dos-games"}, nil
 					},
 				},
@@ -225,19 +240,19 @@ func TestCreate(t *testing.T) {
 				c: managed.ExternalCreation{},
 			},
 		},
-		"DeploymentFailure": {
-			reason: "Should return error when deployment fails",
+		"PackageBeingDeleted": {
+			reason: "Should skip deployment when package is being deleted",
 			fields: fields{
-				client: &zarfclient.MockClient{
-					MockDeploy: func(ctx context.Context, opts zarfclient.DeployOptions) (zarfclient.Result, error) {
-						return zarfclient.Result{}, errors.New("deployment failed")
-					},
-				},
+				client: &zarfclient.MockClient{},
 			},
 			args: args{
 				ctx: context.Background(),
 				mg: &v1alpha1.ZarfPackage{
-					ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "test-package",
+						Finalizers:        []string{"zarf.dev/finalizer"},
+						DeletionTimestamp: &metav1.Time{Time: metav1.Now().Time},
+					},
 					Spec: v1alpha1.ZarfPackageSpec{
 						ForProvider: v1alpha1.ZarfPackageParameters{
 							Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
@@ -246,7 +261,7 @@ func TestCreate(t *testing.T) {
 				},
 			},
 			want: want{
-				err: errors.New("failed to deploy package: deployment failed"),
+				c: managed.ExternalCreation{},
 			},
 		},
 	}
@@ -259,15 +274,16 @@ func TestCreate(t *testing.T) {
 			}
 			existing := pkg.DeepCopy()
 			fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithStatusSubresource(&v1alpha1.ZarfPackage{}).WithObjects(existing).Build()
-			e := external{client: tc.fields.client, kube: fakeClient}
+			e := newExternalForTest(tc.fields.client, fakeClient)
 			got, err := e.Create(tc.args.ctx, pkg)
-			switch {
-			case tc.want.err != nil && err == nil:
-				t.Errorf("\n%s\ne.Create(...): expected error but got nil\n", tc.reason)
-			case tc.want.err == nil && err != nil:
-				t.Errorf("\n%s\ne.Create(...): expected no error but got: %v\n", tc.reason, err)
-			case tc.want.err != nil && err != nil && !strings.Contains(err.Error(), "deployment failed"):
-				t.Errorf("\n%s\ne.Create(...): expected error containing 'deployment failed' but got: %v\n", tc.reason, err)
+			if tc.want.err != nil {
+				if err == nil {
+					t.Errorf("\n%s\ne.Create(...): expected error but got nil\n", tc.reason)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("\n%s\ne.Create(...): expected no error but got: %v\n", tc.reason, err)
+				}
 			}
 			if diff := cmp.Diff(tc.want.c, got); diff != "" {
 				t.Errorf("\n%s\ne.Create(...): -want, +got:\n%s\n", tc.reason, diff)
@@ -301,6 +317,10 @@ func TestDelete(t *testing.T) {
 			reason: "Should successfully remove package",
 			fields: fields{
 				client: &zarfclient.MockClient{
+					MockIsInstalled: func(ctx context.Context, source, namespace string) (bool, *state.DeployedPackage, error) {
+						// Indicate package is installed so removal is attempted
+						return true, &state.DeployedPackage{Name: "dos-games"}, nil
+					},
 					MockRemove: func(ctx context.Context, packageName, namespace string) error {
 						return nil
 					},
@@ -325,6 +345,10 @@ func TestDelete(t *testing.T) {
 			reason: "Should return error when removal fails",
 			fields: fields{
 				client: &zarfclient.MockClient{
+					MockIsInstalled: func(ctx context.Context, source, namespace string) (bool, *state.DeployedPackage, error) {
+						// Indicate package is installed so removal is attempted
+						return true, &state.DeployedPackage{Name: "dos-games"}, nil
+					},
 					MockRemove: func(ctx context.Context, packageName, namespace string) error {
 						return errors.New("removal failed")
 					},
@@ -348,7 +372,7 @@ func TestDelete(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			e := external{client: tc.fields.client}
+			e := newExternalForTest(tc.fields.client, nil)
 			got, err := e.Delete(tc.args.ctx, tc.args.mg)
 			switch {
 			case tc.want.err != nil && err == nil:
