@@ -1,24 +1,24 @@
-apiVersion: pkg.crossplane.io/v1
-kind: Provider
-metadata:
-  name: provider-zarf
-spec:
-  package: docker.io/build-cb4283cf/provider-zarf-arm64:latest
-  packagePullPolicy: Never  # Use the local image we loaded into kind
----
-apiVersion: zarf.dev/v1alpha1
-kind: ProviderConfig
-metadata:
-  name: default
-spec:
-  # Default configuration for Kubernetes Service Account auth (in-cluster)
-  credentials:
-    source: "ServiceAccount"
+# apiVersion: pkg.crossplane.io/v1
+# kind: Provider
+# metadata:
+#   name: provider-zarf
+# spec:
+#   package: ghcr.io/enel1221/provider-zarf:v0.0.30
+#   packagePullPolicy: Never  # Use the local image we loaded into kind
+# ---
+# apiVersion: zarf.dev/v1alpha1
+# kind: ProviderConfig
+# metadata:
+#   name: default
+# spec:
+#   # Default configuration for Kubernetes Service Account auth (in-cluster)
+#   credentials:
+#     source: "ServiceAccount"
   
-  # Default registry auth (can be overridden per resource)
-  defaultRegistryAuth:
-    ghcr.io: "github-registry-secret"
-    registry1.dso.mil: "ironbank-registry-secret"
+#   # Default registry auth (can be overridden per resource)
+#   defaultRegistryAuth:
+#     ghcr.io: "github-registry-secret"
+#     registry1.dso.mil: "ironbank-registry-secret"
   
-  # Default timeout for operations
-  defaultTimeout: "15m"
+#   # Default timeout for operations
+#   defaultTimeout: "15m"

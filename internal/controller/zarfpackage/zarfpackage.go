@@ -223,8 +223,16 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.Wrap(err, "failed to check if package is installed")
 	}
 
+	// Set external name if needed (ensures Crossplane tracks it correctly).
+	if existing := xpmeta.GetExternalName(cr); existing != packageName {
+		xpmeta.SetExternalName(cr, packageName)
+	}
+
+	// Set status fields consistently here based on external query.
+	cr.Status.AtProvider.PackageName = packageName
+
 	if !installed {
-		cr.Status.SetConditions(
+		cr.SetConditions(
 			xpv1.Condition{
 				Type:               xpv1.TypeReady,
 				Status:             corev1.ConditionFalse,
@@ -232,43 +240,15 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				Message:            "Zarf package is not installed",
 				LastTransitionTime: metav1.Now(),
 			},
-			xpv1.Condition{
-				Type:               xpv1.TypeSynced,
-				Status:             corev1.ConditionTrue,
-				Reason:             "ReconcileSuccess",
-				Message:            "Successfully checked package status",
-				LastTransitionTime: metav1.Now(),
-			},
 		)
-		cr.Status.AtProvider.Phase = "NotInstalled" 
-		cr.Status.AtProvider.PackageName = packageName
+		cr.Status.AtProvider.Phase = "NotInstalled"
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
-	// The package is installed. Set the correct external name and status.
-	// This ensures Crossplane knows the actual Zarf package name for future operations.
-	if existing := xpmeta.GetExternalName(cr); existing != packageName {
-		xpmeta.SetExternalName(cr, packageName)
-	}
-	
-	cr.Status.SetConditions(
-		xpv1.Condition{
-			Type:               xpv1.TypeReady,
-			Status:             corev1.ConditionTrue,
-			Reason:             "Available",
-			Message:            "Zarf package is deployed and ready",
-			LastTransitionTime: metav1.Now(),
-		},
-		xpv1.Condition{
-			Type:               xpv1.TypeSynced,
-			Status:             corev1.ConditionTrue,
-			Reason:             "ReconcileSuccess",
-			Message:            "Successfully reconciled Zarf package",
-			LastTransitionTime: metav1.Now(),
-		},
-	)
+	// Installed: assume ready (add a deeper health check here if Zarf needs it, e.g., poll components).
 	cr.Status.AtProvider.Phase = "Installed"
-	cr.Status.AtProvider.PackageName = packageName
+	// Only set Ready True (framework adds Synced True/ReconcileSuccess).
+	cr.SetConditions(xpv1.Available())
 
 	return managed.ExternalObservation{
 		ResourceExists:    true,
