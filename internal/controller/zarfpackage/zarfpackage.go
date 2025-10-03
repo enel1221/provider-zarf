@@ -48,7 +48,13 @@ package zarfpackage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +62,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -134,6 +141,16 @@ func (dt *deploymentTracker) untrack(uid types.UID) {
 	defer dt.mu.Unlock()
 	delete(dt.deployments, uid)
 }
+
+// isTracked returns true if a deployment is currently in progress for the given UID.
+func (dt *deploymentTracker) isTracked(uid types.UID) bool {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	_, exists := dt.deployments[uid]
+	return exists
+}
+
+const defaultRegistrySecretNamespace = "crossplane-system"
 
 // Global deployment tracker shared across all external clients
 var globalDeploymentTracker = newDeploymentTracker()
@@ -366,6 +383,24 @@ func (c *external) handleNotInstalled(cr *v1alpha1.ZarfPackage, packageName stri
 
 // handleInstalled handles the case where the package is installed and ready.
 func (c *external) handleInstalled(cr *v1alpha1.ZarfPackage, packageName string) (managed.ExternalObservation, error) {
+	desiredHash := computeSpecHash(cr.Spec.ForProvider)
+	currentHash := strings.TrimSpace(cr.Status.AtProvider.LastAppliedSpecHash)
+
+	if currentHash == "" {
+		cr.Status.AtProvider.LastAppliedSpecHash = desiredHash
+		currentHash = desiredHash
+	}
+
+	if desiredHash != "" && currentHash != "" && desiredHash != currentHash {
+		c.logger.Info("Spec drift detected, Zarf package requires update", "packageName", packageName, "currentHash", currentHash, "desiredHash", desiredHash)
+		cr.Status.AtProvider.PackageName = packageName
+		cr.Status.AtProvider.Phase = "Updating"
+		cr.SetConditions(xpv1.Creating())
+		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: false}, nil
+	}
+
+	cr.Status.AtProvider.LastAppliedSpecHash = desiredHash
+
 	c.logger.Info("Package installed", "packageName", packageName)
 	cr.Status.AtProvider.PackageName = packageName
 	cr.Status.AtProvider.Phase = "Installed"
@@ -446,7 +481,15 @@ func (c *external) startBackgroundDeployment(ctx context.Context, cr *v1alpha1.Z
 	c.recorder.Event(cr, event.Normal("DeploymentStarted", "Starting Zarf package deployment in background"))
 
 	deployTimeout := c.getDeployTimeout(cr)
-	opts := c.buildDeployOptions(cr, deployTimeout)
+	registryConfig, err := c.resolveRegistryDockerConfig(ctx, cr)
+	if err != nil {
+		wrapped := errors.Wrap(err, "resolve registry credentials")
+		c.logger.Info("Failed to resolve registry credentials", "error", wrapped)
+		c.recorder.Event(cr, event.Warning("RegistryAuthError", wrapped))
+		return managed.ExternalCreation{}, wrapped
+	}
+	desiredHash := computeSpecHash(cr.Spec.ForProvider)
+	opts := c.buildDeployOptions(cr, deployTimeout, registryConfig, desiredHash)
 
 	// Start deployment goroutine
 	// Note: We pass ctx for linting but use background context inside the goroutine
@@ -470,20 +513,148 @@ func (c *external) getDeployTimeout(cr *v1alpha1.ZarfPackage) time.Duration {
 }
 
 // buildDeployOptions constructs deployment options from the resource spec.
-func (c *external) buildDeployOptions(cr *v1alpha1.ZarfPackage, deployTimeout time.Duration) zarfclient.DeployOptions {
+func (c *external) buildDeployOptions(cr *v1alpha1.ZarfPackage, deployTimeout time.Duration, registryDockerConfig []byte, specHash string) zarfclient.DeployOptions {
 	return zarfclient.DeployOptions{
-		Source:                  cr.Spec.ForProvider.Source,
-		Namespace:               cr.Spec.ForProvider.Namespace,
-		Components:              cr.Spec.ForProvider.Components,
-		Variables:               cr.Spec.ForProvider.Variables,
-		Architecture:            cr.Spec.ForProvider.Architecture,
-		Retries:                 cr.Spec.ForProvider.Retries,
-		Timeout:                 &deployTimeout,
-		AdoptExisting:           cr.Spec.ForProvider.AdoptExistingResources,
-		SkipSignatureValidation: cr.Spec.ForProvider.SkipSignatureValidation,
-		PlainHTTP:               cr.Spec.ForProvider.PlainHTTP,
-		InsecureSkipTLSVerify:   cr.Spec.ForProvider.InsecureSkipTLSVerify,
+		Source:                   cr.Spec.ForProvider.Source,
+		Namespace:                cr.Spec.ForProvider.Namespace,
+		Components:               cr.Spec.ForProvider.Components,
+		Variables:                cr.Spec.ForProvider.Variables,
+		Architecture:             cr.Spec.ForProvider.Architecture,
+		Retries:                  cr.Spec.ForProvider.Retries,
+		Timeout:                  &deployTimeout,
+		AdoptExisting:            cr.Spec.ForProvider.AdoptExistingResources,
+		SkipSignatureValidation:  cr.Spec.ForProvider.SkipSignatureValidation,
+		PlainHTTP:                cr.Spec.ForProvider.PlainHTTP,
+		InsecureSkipTLSVerify:    cr.Spec.ForProvider.InsecureSkipTLSVerify,
+		RegistryDockerConfigJSON: registryDockerConfig,
+		DesiredSpecHash:          specHash,
 	}
+}
+
+func (c *external) resolveRegistryDockerConfig(ctx context.Context, cr *v1alpha1.ZarfPackage) ([]byte, error) {
+	ref := cr.Spec.ForProvider.RegistrySecretRef
+	if ref == nil || strings.TrimSpace(ref.Name) == "" {
+		return nil, nil
+	}
+
+	secretNamespace := strings.TrimSpace(ref.Namespace)
+	if secretNamespace == "" {
+		secretNamespace = defaultRegistrySecretNamespace
+	}
+
+	secret := &corev1.Secret{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Namespace: secretNamespace, Name: ref.Name}, secret); err != nil {
+		return nil, errors.Wrapf(err, "get registry secret %s/%s", secretNamespace, ref.Name)
+	}
+
+	registryHost := inferRegistryHostFromSource(cr.Spec.ForProvider.Source)
+	configJSON, err := dockerConfigJSONFromSecret(secret, registryHost)
+	if err != nil {
+		return nil, errors.Wrapf(err, "build docker config from secret %s/%s", secretNamespace, ref.Name)
+	}
+
+	return configJSON, nil
+}
+
+func dockerConfigJSONFromSecret(secret *corev1.Secret, fallbackHost string) ([]byte, error) {
+	if secret == nil {
+		return nil, nil
+	}
+
+	if cfg, err := normalizeDockerConfigJSON(secret.Data[corev1.DockerConfigJsonKey]); err != nil {
+		return nil, err
+	} else if cfg != nil {
+		return cfg, nil
+	}
+
+	if cfg, err := convertLegacyDockerConfig(secret.Data[corev1.DockerConfigKey]); err != nil {
+		return nil, err
+	} else if cfg != nil {
+		return cfg, nil
+	}
+
+	if len(secret.Data) == 0 {
+		return nil, nil
+	}
+
+	cfg, handled, err := dockerConfigFromCredentials(secret.Data, fallbackHost)
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		return cfg, nil
+	}
+
+	return nil, errors.New("secret does not contain recognizable docker registry credentials")
+}
+
+func normalizeDockerConfigJSON(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if json.Valid(raw) {
+		return append([]byte(nil), raw...), nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(raw))
+	if err != nil {
+		return nil, errors.New("secret contains .dockerconfigjson but the payload is not valid JSON")
+	}
+	if !json.Valid(decoded) {
+		return nil, errors.New("secret contains .dockerconfigjson but the payload is not valid JSON")
+	}
+	return decoded, nil
+}
+
+func convertLegacyDockerConfig(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	payload := raw
+	if !json.Valid(payload) {
+		if decoded, err := base64.StdEncoding.DecodeString(string(raw)); err == nil {
+			payload = decoded
+		}
+	}
+	legacy := map[string]map[string]string{}
+	if err := json.Unmarshal(payload, &legacy); err != nil {
+		return nil, errors.Wrap(err, "parse legacy docker config secret")
+	}
+	cfg := map[string]map[string]map[string]string{"auths": legacy}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal docker config from legacy secret")
+	}
+	return out, nil
+}
+
+func dockerConfigFromCredentials(data map[string][]byte, fallbackHost string) ([]byte, bool, error) {
+	username := strings.TrimSpace(string(data["username"]))
+	password := string(data["password"])
+	if username == "" || password == "" {
+		return nil, false, nil
+	}
+	if fallbackHost == "" {
+		return nil, true, errors.New("cannot build docker auth config without registry hostname")
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	entry := map[string]string{
+		"username": username,
+		"password": password,
+		"auth":     auth,
+	}
+	if emailBytes, ok := data["email"]; ok && len(emailBytes) > 0 {
+		entry["email"] = string(emailBytes)
+	}
+	cfg := map[string]map[string]map[string]string{
+		"auths": {
+			fallbackHost: entry,
+		},
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, true, errors.Wrap(err, "marshal docker auth config")
+	}
+	return out, true, nil
 }
 
 // launchDeploymentGoroutine starts the background deployment process.
@@ -515,7 +686,7 @@ func (c *external) launchDeploymentGoroutine(ctx context.Context, cr *v1alpha1.Z
 			return
 		}
 
-		c.handleDeploymentSuccess(context.Background(), resourceKey, deployLogger, packageName, result)
+		c.handleDeploymentSuccess(context.Background(), resourceKey, deployLogger, packageName, result, opts.DesiredSpecHash)
 	}()
 
 	c.logger.V(1).Info("Deployment started in background, returning from Create()", "packageName", packageName)
@@ -534,35 +705,7 @@ func (c *external) handleDeploymentError(ctx context.Context, key client.ObjectK
 	failureTime := metav1.NewTime(time.Now())
 
 	updated, err := c.mutateStatus(ctx, key, func(pkg *v1alpha1.ZarfPackage) bool {
-		changed := false
-		at := &pkg.Status.AtProvider
-		if at.Phase != "Failed" {
-			at.Phase = "Failed"
-			changed = true
-		}
-		if at.ConsecutiveFailures < maxConsecutiveFailures {
-			at.ConsecutiveFailures++
-			changed = true
-		} else if at.ConsecutiveFailures != maxConsecutiveFailures {
-			at.ConsecutiveFailures = maxConsecutiveFailures
-			changed = true
-		}
-		if at.ConsecutiveFailures >= maxConsecutiveFailures && !at.CircuitBreakerActive {
-			at.CircuitBreakerActive = true
-			changed = true
-		}
-		if at.LastFailureMessage != failureMessage {
-			at.LastFailureMessage = failureMessage
-			changed = true
-		}
-		if at.LastFailureTime == nil || !at.LastFailureTime.Equal(&failureTime) {
-			at.LastFailureTime = &metav1.Time{Time: failureTime.Time}
-			changed = true
-		}
-		pkg.SetConditions(xpv1.ReconcileError(deployErr))
-		xpmeta.SetExternalCreateFailed(pkg, failureTime.Time)
-		changed = true
-		return changed
+		return applyDeploymentFailureStatus(pkg, failureMessage, failureTime, deployErr)
 	})
 	if err != nil {
 		logger.Error(err, "Failed to update status after deployment failure")
@@ -578,7 +721,7 @@ func (c *external) handleDeploymentError(ctx context.Context, key client.ObjectK
 }
 
 // handleDeploymentSuccess records a completed deployment, resets circuit breakers, and emits events.
-func (c *external) handleDeploymentSuccess(ctx context.Context, key client.ObjectKey, logger logr.Logger, packageName string, result zarfclient.Result) {
+func (c *external) handleDeploymentSuccess(ctx context.Context, key client.ObjectKey, logger logr.Logger, packageName string, result zarfclient.Result, specHash string) {
 	logger.V(1).Info("Background deployment completed successfully", "requestedPackage", packageName, "reportedPackage", result.PackageName, "deployedAt", result.DeployedAt)
 
 	successTime := time.Now()
@@ -587,28 +730,7 @@ func (c *external) handleDeploymentSuccess(ctx context.Context, key client.Objec
 		deployedAt = successTime
 	}
 	updated, err := c.mutateStatus(ctx, key, func(pkg *v1alpha1.ZarfPackage) bool {
-		changed := false
-		at := &pkg.Status.AtProvider
-		if at.Phase != "Installed" {
-			at.Phase = "Installed"
-			changed = true
-		}
-		if at.PackageName != result.PackageName {
-			at.PackageName = result.PackageName
-			changed = true
-		}
-		if at.LastDeployTime == nil || !at.LastDeployTime.Time.Equal(deployedAt) {
-			deployTime := metav1.NewTime(deployedAt)
-			at.LastDeployTime = &deployTime
-			changed = true
-		}
-		if resetCircuitBreakerState(at) {
-			changed = true
-		}
-		pkg.SetConditions(xpv1.Available(), xpv1.ReconcileSuccess())
-		xpmeta.SetExternalCreateSucceeded(pkg, successTime)
-		changed = true
-		return changed
+		return applyDeploymentSuccessStatus(pkg, result.PackageName, deployedAt, successTime, specHash)
 	})
 	if err != nil {
 		logger.Error(err, "Failed to update status after deployment success")
@@ -620,11 +742,49 @@ func (c *external) handleDeploymentSuccess(ctx context.Context, key client.Objec
 	}
 }
 
-// Update is not yet implemented. In a real-world scenario, this would handle
-// upgrading a Zarf package to a new version.
+// Update handles re-deploying a Zarf package when the spec drifts from the last applied configuration.
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
-	// For now, we'll just log that an update was requested.
-	c.logger.Info("Update called, but not yet implemented")
+	cr, ok := mg.(*v1alpha1.ZarfPackage)
+	if !ok {
+		return managed.ExternalUpdate{}, errors.New(errNotZarfPackage)
+	}
+
+	if !cr.GetDeletionTimestamp().IsZero() {
+		c.logger.V(1).Info("Resource is deleting, skipping update")
+		return managed.ExternalUpdate{}, nil
+	}
+
+	desiredHash := computeSpecHash(cr.Spec.ForProvider)
+	currentHash := strings.TrimSpace(cr.Status.AtProvider.LastAppliedSpecHash)
+	if desiredHash == currentHash {
+		c.logger.V(1).Info("Spec hash unchanged, no update required", "hash", desiredHash)
+		return managed.ExternalUpdate{}, nil
+	}
+
+	packageName := c.getPackageName(cr)
+	resourceUID := cr.GetUID()
+
+	if globalDeploymentTracker.cancel(resourceUID) {
+		c.logger.Info("Cancelled in-progress deployment prior to update", "packageName", packageName)
+		c.recorder.Event(cr, event.Normal("DeploymentCancelled", "Cancelled in-progress deployment to apply update"))
+		// small delay to allow goroutine cleanup
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	deployTimeout := c.getDeployTimeout(cr)
+	registryConfig, err := c.resolveRegistryDockerConfig(ctx, cr)
+	if err != nil {
+		wrapped := errors.Wrap(err, "resolve registry credentials")
+		c.logger.Info("Failed to resolve registry credentials for update", "error", wrapped)
+		c.recorder.Event(cr, event.Warning("RegistryAuthError", wrapped))
+		return managed.ExternalUpdate{}, wrapped
+	}
+
+	opts := c.buildDeployOptions(cr, deployTimeout, registryConfig, desiredHash)
+	c.logger.Info("Redeploying Zarf package to apply spec changes", "packageName", packageName, "desiredHash", desiredHash, "currentHash", currentHash)
+	c.recorder.Event(cr, event.Normal("Redeploying", fmt.Sprintf("Redeploying Zarf package %s to apply spec changes", packageName)))
+
+	c.launchDeploymentGoroutine(ctx, cr, packageName, opts, deployTimeout)
 	return managed.ExternalUpdate{}, nil
 }
 
@@ -732,6 +892,70 @@ func (c *external) mutateStatus(ctx context.Context, key client.ObjectKey, mutat
 	return updated, err
 }
 
+func applyDeploymentFailureStatus(pkg *v1alpha1.ZarfPackage, failureMessage string, failureTime metav1.Time, deployErr error) bool {
+	at := &pkg.Status.AtProvider
+	setStringIfDifferent(&at.Phase, "Failed")
+
+	newFailureCount := at.ConsecutiveFailures + 1
+	if newFailureCount > maxConsecutiveFailures {
+		newFailureCount = maxConsecutiveFailures
+	}
+	if at.ConsecutiveFailures != newFailureCount {
+		at.ConsecutiveFailures = newFailureCount
+	}
+
+	if at.ConsecutiveFailures >= maxConsecutiveFailures && !at.CircuitBreakerActive {
+		at.CircuitBreakerActive = true
+	}
+
+	setStringIfDifferent(&at.LastFailureMessage, failureMessage)
+
+	if at.LastFailureTime == nil || !at.LastFailureTime.Equal(&failureTime) {
+		ft := metav1.NewTime(failureTime.Time)
+		at.LastFailureTime = &ft
+	}
+
+	pkg.SetConditions(xpv1.ReconcileError(deployErr))
+	xpmeta.SetExternalCreateFailed(pkg, failureTime.Time)
+	return true
+}
+
+func applyDeploymentSuccessStatus(pkg *v1alpha1.ZarfPackage, packageName string, deployedAt time.Time, successTime time.Time, specHash string) bool {
+	at := &pkg.Status.AtProvider
+	setStringIfDifferent(&at.Phase, "Installed")
+
+	setStringIfDifferent(&at.PackageName, packageName)
+
+	if deployedAt.IsZero() {
+		deployedAt = successTime
+	}
+	if at.LastDeployTime == nil || !at.LastDeployTime.Time.Equal(deployedAt) {
+		deployTime := metav1.NewTime(deployedAt)
+		at.LastDeployTime = &deployTime
+	}
+
+	resetCircuitBreakerState(at)
+
+	if specHash != "" && at.LastAppliedSpecHash != specHash {
+		at.LastAppliedSpecHash = specHash
+	}
+
+	pkg.SetConditions(xpv1.Available(), xpv1.ReconcileSuccess())
+	xpmeta.SetExternalCreateSucceeded(pkg, successTime)
+	return true
+}
+
+func setStringIfDifferent(target *string, value string) bool {
+	if target == nil {
+		return false
+	}
+	if *target == value {
+		return false
+	}
+	*target = value
+	return true
+}
+
 func trimStatusMessage(err error) string {
 	if err == nil {
 		return ""
@@ -780,6 +1004,99 @@ func circuitBreakerCooldownRemaining(obs *v1alpha1.ZarfPackageObservation, now t
 		return 0
 	}
 	return remaining
+}
+
+func computeSpecHash(params v1alpha1.ZarfPackageParameters) string {
+	var builder strings.Builder
+	builder.WriteString("source=")
+	builder.WriteString(strings.TrimSpace(params.Source))
+	builder.WriteString(";namespace=")
+	builder.WriteString(strings.TrimSpace(params.Namespace))
+	builder.WriteString(";architecture=")
+	builder.WriteString(strings.TrimSpace(params.Architecture))
+	builder.WriteString(";key=")
+	builder.WriteString(strings.TrimSpace(params.Key))
+	builder.WriteString(";confirm=")
+	builder.WriteString(strconv.FormatBool(params.Confirm))
+	builder.WriteString(";adopt=")
+	builder.WriteString(strconv.FormatBool(params.AdoptExistingResources))
+	builder.WriteString(";skipSignature=")
+	builder.WriteString(strconv.FormatBool(params.SkipSignatureValidation))
+	builder.WriteString(";plainHTTP=")
+	builder.WriteString(strconv.FormatBool(params.PlainHTTP))
+	builder.WriteString(";insecureTLS=")
+	builder.WriteString(strconv.FormatBool(params.InsecureSkipTLSVerify))
+	builder.WriteString(";retries=")
+	if params.Retries != nil {
+		builder.WriteString(strconv.Itoa(*params.Retries))
+	}
+	builder.WriteString(";timeout=")
+	if params.Timeout != nil {
+		builder.WriteString(params.Timeout.Duration.String())
+	}
+
+	components := append([]string(nil), params.Components...)
+	sort.Strings(components)
+	builder.WriteString(";components=")
+	for _, comp := range components {
+		builder.WriteString(comp)
+		builder.WriteByte(',')
+	}
+
+	varKeys := make([]string, 0, len(params.Variables))
+	for k := range params.Variables {
+		varKeys = append(varKeys, k)
+	}
+	sort.Strings(varKeys)
+	builder.WriteString(";variables=")
+	for _, k := range varKeys {
+		builder.WriteString(k)
+		builder.WriteByte('=')
+		builder.WriteString(params.Variables[k])
+		builder.WriteByte(',')
+	}
+
+	featureKeys := make([]string, 0, len(params.Features))
+	for k := range params.Features {
+		featureKeys = append(featureKeys, k)
+	}
+	sort.Strings(featureKeys)
+	builder.WriteString(";features=")
+	for _, k := range featureKeys {
+		builder.WriteString(k)
+		builder.WriteByte('=')
+		builder.WriteString(strconv.FormatBool(params.Features[k]))
+		builder.WriteByte(',')
+	}
+
+	if params.RegistrySecretRef != nil {
+		builder.WriteString(";registryName=")
+		builder.WriteString(strings.TrimSpace(params.RegistrySecretRef.Name))
+		builder.WriteString(";registryNamespace=")
+		builder.WriteString(strings.TrimSpace(params.RegistrySecretRef.Namespace))
+	} else {
+		builder.WriteString(";registryName=;registryNamespace=;")
+	}
+
+	sum := sha256.Sum256([]byte(builder.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func inferRegistryHostFromSource(source string) string {
+	trimmed := strings.TrimSpace(source)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimPrefix(trimmed, "oci://")
+	trimmed = strings.TrimPrefix(trimmed, "https://")
+	trimmed = strings.TrimPrefix(trimmed, "http://")
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.Index(trimmed, "/"); idx >= 0 {
+		return trimmed[:idx]
+	}
+	return trimmed
 }
 
 // extractPackageName extracts the package name from a Zarf package source string.

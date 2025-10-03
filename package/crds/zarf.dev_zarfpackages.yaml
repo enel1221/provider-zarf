@@ -134,16 +134,15 @@ spec:
                       This can be used to pull Zarf packages from private registries.
                     properties:
                       name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        description: Name of the secret.
                         type: string
+                      namespace:
+                        description: Namespace of the secret.
+                        type: string
+                    required:
+                    - name
+                    - namespace
                     type: object
-                    x-kubernetes-map-type: atomic
                   retries:
                     description: |-
                       Retries specifies the number of times to retry Zarf operations.
@@ -351,9 +350,38 @@ spec:
                   ZarfPackageObservation are the observable fields of a ZarfPackage.
                   These are fields that are observed from the external resource after it has been created.
                 properties:
+                  circuitBreakerActive:
+                    description: |-
+                      CircuitBreakerActive indicates whether the controller has paused reconcile
+                      attempts due to repeated failures. It automatically resets after a cooldown
+                      period.
+                    type: boolean
+                  consecutiveFailures:
+                    description: |-
+                      ConsecutiveFailures tracks how many times in a row the deployment has failed.
+                      This is used to drive circuit breaker behaviour so that persistent failures
+                      do not result in hot looping reconciliation.
+                    format: int64
+                    type: integer
+                  lastAppliedSpecHash:
+                    description: |-
+                      LastAppliedSpecHash stores a deterministic hash of the spec that was applied
+                      during the last successful deployment. It is used to detect drift between
+                      the desired spec and the deployed package.
+                    type: string
                   lastDeployTime:
                     description: LastDeployTime represents the time when the package
                       was last successfully deployed.
+                    format: date-time
+                    type: string
+                  lastFailureMessage:
+                    description: |-
+                      LastFailureMessage is a short, user-facing explanation of the most recent
+                      failure that triggered a retry or circuit breaker event.
+                    type: string
+                  lastFailureTime:
+                    description: LastFailureTime is the timestamp for the most recent
+                      deployment failure.
                     format: date-time
                     type: string
                   packageName:

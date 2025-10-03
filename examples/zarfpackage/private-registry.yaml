@@ -1,0 +1,49 @@
+# This example demonstrates how to authenticate to a private OCI registry when pulling a Zarf
+# package. Update the placeholders before applying the manifest.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: private-registry-auth
+  namespace: crossplane-system
+  labels:
+    app.kubernetes.io/name: provider-zarf
+    app.kubernetes.io/component: registry-auth
+    app.kubernetes.io/part-of: provider-zarf
+  annotations:
+    # Optional metadata helps track ownership. Remove or adjust as needed.
+    description: "Docker credentials for pulling private Zarf packages"
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: |
+    {
+      "auths": {
+        "ghcr.io": {
+          "username": "REPLACE_ME",
+          "password": "REPLACE_ME"
+        }
+      }
+    }
+---
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: private-package-example
+spec:
+  forProvider:
+    source: oci://ghcr.io/acme/private-zarf-package:1.0.0
+    namespace: demo
+    components:
+      - core
+    registrySecretRef:
+      name: private-registry-auth
+      namespace: crossplane-system
+    timeout:
+      duration: 30m
+  managementPolicies:
+    - Observe
+    - Create
+    - Update
+    - Delete
+  providerConfigRef:
+    name: default

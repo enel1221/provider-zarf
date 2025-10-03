@@ -17,7 +17,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -102,7 +101,7 @@ type ZarfPackageParameters struct {
 	// RegistrySecretRef specifies a reference to a secret containing Docker registry credentials.
 	// This can be used to pull Zarf packages from private registries.
 	// +optional
-	RegistrySecretRef *corev1.LocalObjectReference `json:"registrySecretRef,omitempty"`
+	RegistrySecretRef *xpv1.SecretReference `json:"registrySecretRef,omitempty"`
 }
 
 // ZarfPackageObservation are the observable fields of a ZarfPackage.
@@ -117,6 +116,11 @@ type ZarfPackageObservation struct {
 
 	// PackageName is the name of the deployed Zarf package.
 	PackageName string `json:"packageName,omitempty"`
+
+	// LastAppliedSpecHash stores a deterministic hash of the spec that was applied
+	// during the last successful deployment. It is used to detect drift between
+	// the desired spec and the deployed package.
+	LastAppliedSpecHash string `json:"lastAppliedSpecHash,omitempty"`
 
 	// ConsecutiveFailures tracks how many times in a row the deployment has failed.
 	// This is used to drive circuit breaker behaviour so that persistent failures

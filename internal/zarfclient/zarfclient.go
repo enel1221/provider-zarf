@@ -39,7 +39,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	// Logging integration
@@ -52,6 +54,7 @@ import (
 	"github.com/zarf-dev/zarf/src/pkg/logger"
 	"github.com/zarf-dev/zarf/src/pkg/packager"
 	"github.com/zarf-dev/zarf/src/pkg/packager/filters"
+	"github.com/zarf-dev/zarf/src/pkg/packager/layout"
 	"github.com/zarf-dev/zarf/src/pkg/state"
 
 	// Kubernetes client
@@ -65,20 +68,22 @@ import (
 // DeployOptions contains all configuration needed to deploy a Zarf package.
 // These options map directly to the ZarfPackage CRD spec fields.
 type DeployOptions struct {
-	Source                  string            // Package source (OCI, HTTP, file, cluster name)
-	Namespace               string            // Target namespace override
-	Components              []string          // Specific components to deploy
-	Variables               map[string]string // Deployment variables (KEY=VALUE)
-	AdoptExisting           bool              // Adopt existing resources
-	SkipSignatureValidation bool              // Skip package signature validation
-	Shasum                  string            // Expected package checksum
-	Architecture            string            // Target architecture (amd64, arm64)
-	PublicKeyPath           string            // Path to public key for validation
-	OCIConcurrency          int               // OCI operation concurrency
-	Retries                 *int              // Number of retries for failed operations
-	Timeout                 *time.Duration    // Deployment timeout
-	PlainHTTP               bool              // Use HTTP instead of HTTPS
-	InsecureSkipTLSVerify   bool              // Skip TLS certificate verification
+	Source                   string            // Package source (OCI, HTTP, file, cluster name)
+	Namespace                string            // Target namespace override
+	Components               []string          // Specific components to deploy
+	Variables                map[string]string // Deployment variables (KEY=VALUE)
+	AdoptExisting            bool              // Adopt existing resources
+	SkipSignatureValidation  bool              // Skip package signature validation
+	Shasum                   string            // Expected package checksum
+	Architecture             string            // Target architecture (amd64, arm64)
+	PublicKeyPath            string            // Path to public key for validation
+	OCIConcurrency           int               // OCI operation concurrency
+	Retries                  *int              // Number of retries for failed operations
+	Timeout                  *time.Duration    // Deployment timeout
+	PlainHTTP                bool              // Use HTTP instead of HTTPS
+	InsecureSkipTLSVerify    bool              // Skip TLS certificate verification
+	RegistryDockerConfigJSON []byte            // Docker config JSON with registry credentials
+	DesiredSpecHash          string            // Hash of the spec that triggered this deployment
 }
 
 // Result contains information about a successful deployment.
@@ -106,6 +111,8 @@ type Client interface {
 // client implements the Client interface
 type client struct{}
 
+var dockerConfigMu sync.Mutex
+
 // =============================================================================
 // LOGGER BRIDGE (slog ↔ logr)
 // =============================================================================
@@ -128,7 +135,7 @@ func (w *logrSlogBridge) Write(p []byte) (n int, err error) {
 		// JSON format from slog - extract level
 		switch {
 		case strings.Contains(msg, `"level":"DEBUG"`) || strings.Contains(msg, `"level":"debug"`):
-			w.logger.V(1).Info(msg)
+			w.logger.Info(msg, "level", "DEBUG")
 		case strings.Contains(msg, `"level":"ERROR"`) || strings.Contains(msg, `"level":"error"`):
 			w.logger.Error(nil, msg)
 		case strings.Contains(msg, `"level":"WARN"`) || strings.Contains(msg, `"level":"warn"`):
@@ -250,50 +257,92 @@ func (c *client) IsInstalled(ctx context.Context, src string, namespaceOverride 
 
 // Deploy performs: load package -> apply component filters -> deploy.
 func (c *client) Deploy(ctx context.Context, opts DeployOptions) (Result, error) {
-	// Get controller logger from context
-	ctrlLogger := ctrllog.FromContext(ctx).WithName("zarf-deploy")
-
-	// Create slog logger that forwards to controller logger
-	bridge := &logrSlogBridge{logger: ctrlLogger}
-	slogLogger := slog.New(slog.NewJSONHandler(bridge, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-
-	// Create context with slog logger for Zarf library
-	deployCtx := logger.WithContext(ctx, slogLogger)
-
+	deployCtx := initializeDeploymentLogging(ctx)
 	l := logger.From(deployCtx)
 	l.Debug("zarfclient: Deploy called", "source", opts.Source)
 
-	if opts.Source == "" {
-		return Result{}, errors.New("source required")
+	source, err := normalizeAndValidateSource(opts.Source, l)
+	if err != nil {
+		return Result{}, err
 	}
-	source := normalizeSource(opts.Source)
-	l.Debug("zarfclient: normalized source", "source", source)
 
-	// Set the global confirmation flag to true to bypass interactive prompts.
 	config.CommonOptions.Confirm = true
 
-	// CRITICAL: Force in-cluster configuration usage for Zarf library
-	// The Zarf library uses clientcmd.NewDefaultClientConfigLoadingRules() which looks for:
-	// 1. KUBECONFIG environment variable
-	// 2. ~/.kube/config file
-	// 3. In-cluster config as fallback
-	// We need to ensure no kubeconfig files exist so it falls back to in-cluster
+	cleanupDockerConfig, err := configureDockerCredentials(opts.RegistryDockerConfigJSON, l)
+	if err != nil {
+		return Result{}, err
+	}
+	defer cleanupDockerConfig()
+
 	if err := ensureInClusterConfig(); err != nil {
 		l.Error("Failed to configure in-cluster access", "error", err)
 		return Result{}, fmt.Errorf("configure in-cluster access: %w", err)
 	}
 	l.Debug("Configured Zarf library for in-cluster access")
 
-	// Component selection -> component filter strategy.
-	filter := filters.Empty()
-	if len(opts.Components) > 0 {
-		// Reuse CLI selection semantics via BySelectState (comma separated, supports exclusions/globs per Zarf rules)
-		filter = filters.BySelectState(strings.Join(opts.Components, ","))
+	filter := buildComponentFilter(opts.Components)
+	layoutOpts := buildLoadOptions(opts, filter)
+
+	l.Debug("zarfclient: loading package")
+	pkgLayout, err := packager.LoadPackage(deployCtx, source, layoutOpts)
+	if err != nil {
+		l.Error("zarfclient: failed to load package", "error", err)
+		return Result{}, fmt.Errorf("load package: %w", err)
+	}
+	defer pkgLayout.Cleanup() //nolint:errcheck
+	l.Info("zarfclient: package loaded successfully", "packageName", pkgLayout.Pkg.Metadata.Name)
+
+	deployOpts := buildDeployOptions(opts)
+
+	if err := ensureClusterConnectivity(deployCtx, deployOpts.Timeout, l); err != nil {
+		return Result{}, err
 	}
 
-	layoutOpts := packager.LoadOptions{
+	if err := executePackageDeployment(deployCtx, pkgLayout, deployOpts, l); err != nil {
+		return Result{}, err
+	}
+
+	l.Info("zarfclient: deployment successful", "packageName", pkgLayout.Pkg.Metadata.Name)
+	return Result{PackageName: pkgLayout.Pkg.Metadata.Name, DeployedAt: time.Now()}, nil
+}
+
+func initializeDeploymentLogging(ctx context.Context) context.Context {
+	ctrlLogger := ctrllog.FromContext(ctx).WithName("zarf-deploy")
+	bridge := &logrSlogBridge{logger: ctrlLogger}
+	slogLogger := slog.New(slog.NewJSONHandler(bridge, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return logger.WithContext(ctx, slogLogger)
+}
+
+func normalizeAndValidateSource(source string, l *slog.Logger) (string, error) {
+	if strings.TrimSpace(source) == "" {
+		return "", errors.New("source required")
+	}
+	normalized := normalizeSource(source)
+	l.Debug("zarfclient: normalized source", "source", normalized)
+	return normalized, nil
+}
+
+func configureDockerCredentials(configJSON []byte, l *slog.Logger) (func(), error) {
+	if len(configJSON) == 0 {
+		return func() {}, nil
+	}
+	cleanup, err := installDockerConfig(configJSON)
+	if err != nil {
+		return nil, fmt.Errorf("install docker config: %w", err)
+	}
+	l.Debug("zarfclient: installed temporary registry credentials for deployment")
+	return cleanup, nil
+}
+
+func buildComponentFilter(components []string) filters.ComponentFilterStrategy {
+	if len(components) == 0 {
+		return filters.Empty()
+	}
+	return filters.BySelectState(strings.Join(components, ","))
+}
+
+func buildLoadOptions(opts DeployOptions, filter filters.ComponentFilterStrategy) packager.LoadOptions {
+	return packager.LoadOptions{
 		Shasum:                  opts.Shasum,
 		Architecture:            opts.Architecture,
 		PublicKeyPath:           opts.PublicKeyPath,
@@ -305,18 +354,9 @@ func (c *client) Deploy(ctx context.Context, opts DeployOptions) (Result, error)
 			InsecureSkipTLSVerify: opts.InsecureSkipTLSVerify,
 		},
 	}
+}
 
-	l.Debug("zarfclient: loading package")
-	// Use the context with logger for all Zarf operations
-	pkgLayout, err := packager.LoadPackage(deployCtx, source, layoutOpts)
-	if err != nil {
-		l.Error("zarfclient: failed to load package", "error", err)
-		return Result{}, fmt.Errorf("load package: %w", err)
-	}
-	defer pkgLayout.Cleanup() //nolint:errcheck
-	l.Info("zarfclient: package loaded successfully", "packageName", pkgLayout.Pkg.Metadata.Name)
-
-	// Map DeployOptions
+func buildDeployOptions(opts DeployOptions) packager.DeployOptions {
 	deployOpts := packager.DeployOptions{
 		SetVariables:           opts.Variables,
 		AdoptExistingResources: opts.AdoptExisting,
@@ -333,40 +373,38 @@ func (c *client) Deploy(ctx context.Context, opts DeployOptions) (Result, error)
 	if opts.Timeout != nil {
 		deployOpts.Timeout = *opts.Timeout
 	} else {
-		// Use the same default as Zarf CLI (30 minutes)
 		deployOpts.Timeout = 30 * time.Minute
 	}
+	return deployOpts
+}
 
-	// Pre-establish cluster connection with reasonable timeout
-	// Use a shorter timeout for cluster connection to avoid hanging
+func ensureClusterConnectivity(ctx context.Context, deployTimeout time.Duration, l *slog.Logger) error {
 	clusterConnectTimeout := 2 * time.Minute
-	if deployOpts.Timeout < clusterConnectTimeout {
-		clusterConnectTimeout = deployOpts.Timeout / 2
+	if deployTimeout > 0 && deployTimeout < clusterConnectTimeout {
+		clusterConnectTimeout = deployTimeout / 2
+		if clusterConnectTimeout == 0 {
+			clusterConnectTimeout = deployTimeout
+		}
 	}
 
-	clusterCtx, clusterCancel := context.WithTimeout(deployCtx, clusterConnectTimeout)
-	defer clusterCancel()
+	clusterCtx, cancel := context.WithTimeout(ctx, clusterConnectTimeout)
+	defer cancel()
 
-	// Use cluster.New() instead of NewWithWait() to avoid waiting for full cluster readiness
-	// This is faster and more appropriate for provider context
-	_, clusterErr := cluster.New(clusterCtx)
-	if clusterErr != nil {
-		l.Error("zarfclient: cluster connection failed", "error", clusterErr, "connectTimeout", clusterConnectTimeout, "deployTimeout", deployOpts.Timeout)
-		return Result{}, fmt.Errorf("cluster connection: %w", clusterErr)
+	if _, err := cluster.New(clusterCtx); err != nil {
+		l.Error("zarfclient: cluster connection failed", "error", err, "connectTimeout", clusterConnectTimeout, "deployTimeout", deployTimeout)
+		return fmt.Errorf("cluster connection: %w", err)
 	}
 	l.Debug("zarfclient: cluster connection established", "connectTimeout", clusterConnectTimeout)
+	return nil
+}
 
+func executePackageDeployment(ctx context.Context, pkgLayout *layout.PackageLayout, deployOpts packager.DeployOptions, l *slog.Logger) error {
 	l.Info("zarfclient: starting packager.Deploy", "timeout", deployOpts.Timeout)
-	// Use the context with logger for the actual deployment
-	_, err = packager.Deploy(deployCtx, pkgLayout, deployOpts)
-	if err != nil {
+	if _, err := packager.Deploy(ctx, pkgLayout, deployOpts); err != nil {
 		l.Error("zarfclient: packager.Deploy failed", "error", err, "timeout", deployOpts.Timeout)
-		return Result{}, fmt.Errorf("deploy: %w", err)
+		return fmt.Errorf("deploy: %w", err)
 	}
-
-	l.Info("zarfclient: deployment successful", "packageName", pkgLayout.Pkg.Metadata.Name)
-	return Result{PackageName: pkgLayout.Pkg.Metadata.Name, DeployedAt: time.Now()}, nil
-
+	return nil
 }
 
 // Remove loads metadata for a deployed package and dispatches packager.Remove.
@@ -415,6 +453,48 @@ func (c *client) Remove(ctx context.Context, packageName string, namespaceOverri
 
 	l.Info("zarfclient: package removal successful", "packageName", pkgMeta.Metadata.Name)
 	return nil
+}
+
+func installDockerConfig(dockerConfig []byte) (func(), error) {
+	if len(dockerConfig) == 0 {
+		return func() {}, nil
+	}
+
+	dockerConfigMu.Lock()
+
+	tempDir, err := os.MkdirTemp("", "provider-zarf-docker-config-*")
+	if err != nil {
+		dockerConfigMu.Unlock()
+		return nil, fmt.Errorf("create temp dir for docker config: %w", err)
+	}
+
+	cleanup := func() {
+		_ = os.RemoveAll(tempDir)
+	}
+
+	configPath := filepath.Join(tempDir, "config.json")
+	if err := os.WriteFile(configPath, dockerConfig, 0o600); err != nil {
+		cleanup()
+		dockerConfigMu.Unlock()
+		return nil, fmt.Errorf("write docker config: %w", err)
+	}
+
+	prevValue, hadPrev := os.LookupEnv("DOCKER_CONFIG")
+	if err := os.Setenv("DOCKER_CONFIG", tempDir); err != nil {
+		cleanup()
+		dockerConfigMu.Unlock()
+		return nil, fmt.Errorf("set DOCKER_CONFIG: %w", err)
+	}
+
+	return func() {
+		if hadPrev {
+			_ = os.Setenv("DOCKER_CONFIG", prevValue)
+		} else {
+			_ = os.Unsetenv("DOCKER_CONFIG")
+		}
+		cleanup()
+		dockerConfigMu.Unlock()
+	}, nil
 }
 
 // inferClusterPackageName returns (name, true) for strings that are valid deployed name style.

@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
@@ -31,6 +32,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -419,5 +421,126 @@ func TestExtractPackageName(t *testing.T) {
 				t.Errorf("extractPackageName(%q) = %q, want %q", tc.source, got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestHandleInstalledDrift(t *testing.T) {
+	mockClient := &zarfclient.MockClient{}
+	e := newExternalForTest(mockClient, nil)
+	pkg := &v1alpha1.ZarfPackage{
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source:     "oci://defenseunicorns/packages/dos-games:1.0.0",
+				Components: []string{"dos-games"},
+			},
+		},
+		Status: v1alpha1.ZarfPackageStatus{AtProvider: v1alpha1.ZarfPackageObservation{PackageName: "dos-games"}},
+	}
+	desiredHash := computeSpecHash(pkg.Spec.ForProvider)
+	previousHash := desiredHash + "-old"
+	pkg.Status.AtProvider.LastAppliedSpecHash = previousHash
+
+	obs, err := e.handleInstalled(pkg, "dos-games")
+	if err != nil {
+		t.Fatalf("handleInstalled returned error: %v", err)
+	}
+	if obs.ResourceUpToDate {
+		t.Fatalf("expected ResourceUpToDate=false when spec hash differs")
+	}
+	if pkg.Status.AtProvider.Phase != "Updating" {
+		t.Fatalf("expected phase Updating, got %s", pkg.Status.AtProvider.Phase)
+	}
+	if pkg.Status.AtProvider.LastAppliedSpecHash != previousHash {
+		t.Fatalf("expected last applied hash to remain %s until redeploy, got %s", previousHash, pkg.Status.AtProvider.LastAppliedSpecHash)
+	}
+}
+
+func TestUpdateRedeploysOnSpecChange(t *testing.T) {
+	prevTracker := globalDeploymentTracker
+	globalDeploymentTracker = newDeploymentTracker()
+	defer func() { globalDeploymentTracker = prevTracker }()
+
+	startCh := make(chan struct{})
+	unblock := make(chan struct{})
+	defer close(unblock)
+
+	pkg := &v1alpha1.ZarfPackage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-package",
+			UID:        types.UID("uid-123"),
+			Finalizers: []string{"finalizer.managedresource.crossplane.io"},
+		},
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source:     "oci://defenseunicorns/packages/dos-games:1.0.0",
+				Components: []string{"dos-games"},
+			},
+		},
+		Status: v1alpha1.ZarfPackageStatus{
+			AtProvider: v1alpha1.ZarfPackageObservation{
+				LastAppliedSpecHash: "old-hash",
+			},
+		},
+	}
+
+	desiredHash := computeSpecHash(pkg.Spec.ForProvider)
+
+	mockClient := &zarfclient.MockClient{
+		MockDeploy: func(ctx context.Context, opts zarfclient.DeployOptions) (zarfclient.Result, error) {
+			if opts.DesiredSpecHash != desiredHash {
+				t.Errorf("expected desired spec hash %s, got %s", desiredHash, opts.DesiredSpecHash)
+			}
+			close(startCh)
+			<-unblock
+			return zarfclient.Result{PackageName: "dos-games", DeployedAt: time.Now()}, nil
+		},
+	}
+
+	existing := pkg.DeepCopy()
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithStatusSubresource(&v1alpha1.ZarfPackage{}).WithObjects(existing).Build()
+	e := newExternalForTest(mockClient, fakeClient)
+
+	if _, err := e.Update(context.Background(), pkg); err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+
+	select {
+	case <-startCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected deployment to start")
+	}
+}
+
+func TestUpdateNoChange(t *testing.T) {
+	prevTracker := globalDeploymentTracker
+	globalDeploymentTracker = newDeploymentTracker()
+	defer func() { globalDeploymentTracker = prevTracker }()
+
+	pkg := &v1alpha1.ZarfPackage{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-package"},
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
+			},
+		},
+	}
+	pkg.Status.AtProvider.LastAppliedSpecHash = computeSpecHash(pkg.Spec.ForProvider)
+
+	deployCalled := false
+	mockClient := &zarfclient.MockClient{
+		MockDeploy: func(ctx context.Context, opts zarfclient.DeployOptions) (zarfclient.Result, error) {
+			deployCalled = true
+			return zarfclient.Result{}, nil
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithStatusSubresource(&v1alpha1.ZarfPackage{}).WithObjects(pkg.DeepCopy()).Build()
+	e := newExternalForTest(mockClient, fakeClient)
+
+	if _, err := e.Update(context.Background(), pkg); err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+	if deployCalled {
+		t.Fatalf("expected no deployment when spec hash unchanged")
 	}
 }
