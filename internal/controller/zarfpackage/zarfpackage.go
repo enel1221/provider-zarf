@@ -143,13 +143,6 @@ func (dt *deploymentTracker) untrack(uid types.UID) {
 }
 
 // isTracked returns true if a deployment is currently in progress for the given UID.
-func (dt *deploymentTracker) isTracked(uid types.UID) bool {
-	dt.mu.RLock()
-	defer dt.mu.RUnlock()
-	_, exists := dt.deployments[uid]
-	return exists
-}
-
 const defaultRegistrySecretNamespace = "crossplane-system"
 
 // Global deployment tracker shared across all external clients
@@ -915,7 +908,9 @@ func applyDeploymentFailureStatus(pkg *v1alpha1.ZarfPackage, failureMessage stri
 		at.LastFailureTime = &ft
 	}
 
-	pkg.SetConditions(xpv1.ReconcileError(deployErr))
+	cond := xpv1.ReconcileError(deployErr)
+	cond.Message = failureMessage
+	pkg.SetConditions(cond)
 	xpmeta.SetExternalCreateFailed(pkg, failureTime.Time)
 	return true
 }
@@ -940,20 +935,21 @@ func applyDeploymentSuccessStatus(pkg *v1alpha1.ZarfPackage, packageName string,
 		at.LastAppliedSpecHash = specHash
 	}
 
-	pkg.SetConditions(xpv1.Available(), xpv1.ReconcileSuccess())
+	successCond := xpv1.ReconcileSuccess()
+	successCond.Message = fmt.Sprintf("Package %s deployed successfully", packageName)
+	pkg.SetConditions(xpv1.Available(), successCond)
 	xpmeta.SetExternalCreateSucceeded(pkg, successTime)
 	return true
 }
 
-func setStringIfDifferent(target *string, value string) bool {
+func setStringIfDifferent(target *string, value string) {
 	if target == nil {
-		return false
+		return
 	}
 	if *target == value {
-		return false
+		return
 	}
 	*target = value
-	return true
 }
 
 func trimStatusMessage(err error) string {

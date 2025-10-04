@@ -25,6 +25,7 @@ func TestInferClusterName(t *testing.T) {
 
 // TestIsInstalledNonName ensures non-name sources short-circuit to false.
 func TestIsInstalledNonName(t *testing.T) {
+	t.Setenv("ZARFCLIENT_SKIP_CLUSTER", "1")
 	cl := New()
 	ok, dep, err := cl.IsInstalled(context.Background(), "ghcr.io/org/pkg:1.0.0", "")
 	if err != nil {

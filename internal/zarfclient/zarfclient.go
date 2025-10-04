@@ -228,6 +228,11 @@ func (c *client) IsInstalled(ctx context.Context, src string, namespaceOverride 
 	observeCtx := logger.WithContext(ctx, slogLogger)
 	zlog := logger.From(observeCtx)
 
+	if !isClusterName && os.Getenv("ZARFCLIENT_SKIP_CLUSTER") == "1" {
+		zlog.Debug("zarfclient: skipping cluster lookup in test mode", "source", src)
+		return false, nil, nil
+	}
+
 	cl, err := cluster.New(observeCtx)
 	if err != nil {
 		return false, nil, err
