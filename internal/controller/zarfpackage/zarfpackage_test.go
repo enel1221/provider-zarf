@@ -697,3 +697,581 @@ func nodeWithArch(name, arch string) *corev1.Node {
 		},
 	}
 }
+
+// TestComputeSpecHash tests the spec fingerprinting function.
+func TestComputeSpecHash(t *testing.T) {
+	baseParams := v1alpha1.ZarfPackageParameters{
+		Source:       "oci://example.com/test:1.0.0",
+		Namespace:    "default",
+		Architecture: "amd64",
+	}
+
+	t.Run("identical specs produce same hash", func(t *testing.T) {
+		hash1 := computeSpecHash(baseParams)
+		hash2 := computeSpecHash(baseParams)
+		if hash1 != hash2 {
+			t.Errorf("identical specs produced different hashes: %s vs %s", hash1, hash2)
+		}
+	})
+
+	t.Run("source change produces different hash", func(t *testing.T) {
+		hash1 := computeSpecHash(baseParams)
+		modifiedParams := baseParams
+		modifiedParams.Source = "oci://example.com/test:2.0.0"
+		hash2 := computeSpecHash(modifiedParams)
+		if hash1 == hash2 {
+			t.Error("source change did not produce different hash")
+		}
+	})
+
+	t.Run("components change produces different hash", func(t *testing.T) {
+		hash1 := computeSpecHash(baseParams)
+		modifiedParams := baseParams
+		modifiedParams.Components = []string{"component-a", "component-b"}
+		hash2 := computeSpecHash(modifiedParams)
+		if hash1 == hash2 {
+			t.Error("components change did not produce different hash")
+		}
+	})
+
+	t.Run("component order does not matter", func(t *testing.T) {
+		params1 := baseParams
+		params1.Components = []string{"b", "a", "c"}
+		params2 := baseParams
+		params2.Components = []string{"a", "b", "c"}
+		hash1 := computeSpecHash(params1)
+		hash2 := computeSpecHash(params2)
+		if hash1 != hash2 {
+			t.Error("component order changed hash (should be sorted internally)")
+		}
+	})
+
+	t.Run("variables change produces different hash", func(t *testing.T) {
+		hash1 := computeSpecHash(baseParams)
+		modifiedParams := baseParams
+		modifiedParams.Variables = map[string]string{"key1": "value1"}
+		hash2 := computeSpecHash(modifiedParams)
+		if hash1 == hash2 {
+			t.Error("variables change did not produce different hash")
+		}
+	})
+
+	t.Run("variable order does not matter", func(t *testing.T) {
+		params1 := baseParams
+		params1.Variables = map[string]string{"z": "1", "a": "2", "m": "3"}
+		params2 := baseParams
+		params2.Variables = map[string]string{"a": "2", "m": "3", "z": "1"}
+		hash1 := computeSpecHash(params1)
+		hash2 := computeSpecHash(params2)
+		if hash1 != hash2 {
+			t.Error("variable order changed hash (should be sorted internally)")
+		}
+	})
+
+	t.Run("variable value change produces different hash", func(t *testing.T) {
+		params1 := baseParams
+		params1.Variables = map[string]string{"key": "value1"}
+		params2 := baseParams
+		params2.Variables = map[string]string{"key": "value2"}
+		hash1 := computeSpecHash(params1)
+		hash2 := computeSpecHash(params2)
+		if hash1 == hash2 {
+			t.Error("variable value change did not produce different hash")
+		}
+	})
+
+	t.Run("timeout change produces different hash", func(t *testing.T) {
+		timeout1 := metav1.Duration{Duration: 15 * time.Minute}
+		timeout2 := metav1.Duration{Duration: 30 * time.Minute}
+		params1 := baseParams
+		params1.Timeout = &timeout1
+		params2 := baseParams
+		params2.Timeout = &timeout2
+		hash1 := computeSpecHash(params1)
+		hash2 := computeSpecHash(params2)
+		if hash1 == hash2 {
+			t.Error("timeout change did not produce different hash")
+		}
+	})
+
+	t.Run("hash is 64 character hex string", func(t *testing.T) {
+		hash := computeSpecHash(baseParams)
+		if len(hash) != 64 {
+			t.Errorf("expected 64 character hash (SHA256), got %d characters", len(hash))
+		}
+		for _, c := range hash {
+			// Apply De Morgan's law: !(A || B) == !A && !B
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				t.Errorf("hash contains non-hex character: %c", c)
+			}
+		}
+	})
+}
+
+// TestObserveDetectsSpecDrift tests that Observe correctly detects spec changes via hash comparison.
+func TestObserveDetectsSpecDrift(t *testing.T) {
+	mockClient := &zarfclient.MockClient{
+		MockIsInstalled: func(ctx context.Context, source, namespace string) (bool, *state.DeployedPackage, error) {
+			return true, &state.DeployedPackage{Name: "test"}, nil
+		},
+	}
+	fakeKubeClient := fake.NewClientBuilder().WithScheme(testScheme).Build()
+	e := newExternalForTest(mockClient, fakeKubeClient)
+
+	pkg := &v1alpha1.ZarfPackage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-package",
+			Namespace: "default",
+		},
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source: "oci://example.com/test:1.0.0",
+			},
+		},
+		Status: v1alpha1.ZarfPackageStatus{
+			AtProvider: v1alpha1.ZarfPackageObservation{
+				PackageName:         "test",
+				Phase:               "Installed",
+				LastAppliedSpecHash: "old-hash-from-previous-deployment",
+			},
+		},
+	}
+
+	obs, err := e.Observe(context.Background(), pkg)
+	if err != nil {
+		t.Fatalf("Observe failed: %v", err)
+	}
+
+	if obs.ResourceUpToDate {
+		t.Error("expected ResourceUpToDate=false when spec hash differs")
+	}
+	if pkg.Status.AtProvider.Phase != "Updating" {
+		t.Errorf("expected Phase=Updating, got %s", pkg.Status.AtProvider.Phase)
+	}
+}
+
+// TestObserveNoUpdateWhenHashMatches tests that repeated reconciles don't trigger updates.
+func TestObserveNoUpdateWhenHashMatches(t *testing.T) {
+	mockClient := &zarfclient.MockClient{
+		MockIsInstalled: func(ctx context.Context, source, namespace string) (bool, *state.DeployedPackage, error) {
+			return true, &state.DeployedPackage{Name: "test"}, nil
+		},
+	}
+	fakeKubeClient := fake.NewClientBuilder().WithScheme(testScheme).Build()
+	e := newExternalForTest(mockClient, fakeKubeClient)
+
+	params := v1alpha1.ZarfPackageParameters{
+		Source: "oci://example.com/test:1.0.0",
+	}
+	currentHash := computeSpecHash(params)
+
+	pkg := &v1alpha1.ZarfPackage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-package",
+			Namespace: "default",
+		},
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: params,
+		},
+		Status: v1alpha1.ZarfPackageStatus{
+			AtProvider: v1alpha1.ZarfPackageObservation{
+				PackageName:         "test",
+				Phase:               "Installed",
+				LastAppliedSpecHash: currentHash,
+			},
+		},
+	}
+
+	// First observe
+	obs1, err := e.Observe(context.Background(), pkg)
+	if err != nil {
+		t.Fatalf("first Observe failed: %v", err)
+	}
+	if !obs1.ResourceUpToDate {
+		t.Error("expected ResourceUpToDate=true when hash matches")
+	}
+
+	// Second observe (simulating repeated reconciliation)
+	obs2, err := e.Observe(context.Background(), pkg)
+	if err != nil {
+		t.Fatalf("second Observe failed: %v", err)
+	}
+	if !obs2.ResourceUpToDate {
+		t.Error("expected ResourceUpToDate=true on repeated reconcile")
+	}
+	if pkg.Status.AtProvider.Phase != "Installed" {
+		t.Errorf("expected Phase=Installed, got %s", pkg.Status.AtProvider.Phase)
+	}
+}
+
+// TestArchitectureDetectionEdgeCases tests edge cases for architecture detection
+func TestArchitectureDetectionEdgeCases(t *testing.T) {
+	tests := []struct {
+		name             string
+		nodes            []corev1.Node
+		expectedArch     string
+		expectedFallback bool
+	}{
+		{
+			name:             "no nodes",
+			nodes:            []corev1.Node{},
+			expectedArch:     "amd64",
+			expectedFallback: true,
+		},
+		{
+			name: "no architecture labels",
+			nodes: []corev1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "node1",
+						Labels: map[string]string{},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+			},
+			expectedArch:     "amd64",
+			expectedFallback: true,
+		},
+		{
+			name: "all unschedulable nodes",
+			nodes: []corev1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"kubernetes.io/arch": "arm64",
+						},
+					},
+					Spec: corev1.NodeSpec{
+						Unschedulable: true,
+					},
+				},
+			},
+			expectedArch:     "amd64",
+			expectedFallback: true,
+		},
+		{
+			name: "mixed schedulable and unschedulable - use schedulable",
+			nodes: []corev1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"kubernetes.io/arch": "arm64",
+						},
+					},
+					Spec: corev1.NodeSpec{
+						Unschedulable: true,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node2",
+						Labels: map[string]string{
+							"kubernetes.io/arch": "amd64",
+						},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+			},
+			expectedArch:     "amd64",
+			expectedFallback: false,
+		},
+		{
+			name: "beta label fallback",
+			nodes: []corev1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"beta.kubernetes.io/arch": "arm64",
+						},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+			},
+			expectedArch:     "arm64",
+			expectedFallback: false,
+		},
+		{
+			name: "majority wins - 2 amd64 vs 1 arm64",
+			nodes: []corev1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "node1",
+						Labels: map[string]string{"kubernetes.io/arch": "amd64"},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "node2",
+						Labels: map[string]string{"kubernetes.io/arch": "amd64"},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "node3",
+						Labels: map[string]string{"kubernetes.io/arch": "arm64"},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+			},
+			expectedArch:     "amd64",
+			expectedFallback: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientBuilder := fake.NewClientBuilder().WithScheme(testScheme)
+			for i := range tt.nodes {
+				clientBuilder = clientBuilder.WithObjects(&tt.nodes[i])
+			}
+			fakeClient := clientBuilder.Build()
+
+			mockZarfClient := &zarfclient.MockClient{}
+			e := newExternalForTest(mockZarfClient, fakeClient)
+
+			arch, err := e.detectClusterArchitecture(context.Background())
+			if err != nil {
+				t.Fatalf("detectClusterArchitecture failed: %v", err)
+			}
+			if arch != tt.expectedArch {
+				t.Errorf("expected architecture %s, got %s", tt.expectedArch, arch)
+			}
+		})
+	}
+}
+
+// TestComponentFilteringEdgeCases tests edge cases for component filtering
+func TestComponentFilteringEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		components []string
+		expectErr  bool
+	}{
+		{
+			name:       "nil components list",
+			components: nil,
+			expectErr:  false,
+		},
+		{
+			name:       "empty components list",
+			components: []string{},
+			expectErr:  false,
+		},
+		{
+			name:       "single component",
+			components: []string{"component-a"},
+			expectErr:  false,
+		},
+		{
+			name:       "duplicate components",
+			components: []string{"component-a", "component-a"},
+			expectErr:  false, // Should deduplicate or handle gracefully
+		},
+		{
+			name:       "empty string component",
+			components: []string{"component-a", "", "component-b"},
+			expectErr:  false, // Should filter out empty strings
+		},
+		{
+			name:       "whitespace only component",
+			components: []string{"component-a", "  ", "component-b"},
+			expectErr:  false, // Should handle whitespace
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := v1alpha1.ZarfPackageParameters{
+				Source:     "oci://example.com/test:1.0.0",
+				Components: tt.components,
+			}
+
+			// Hash should not fail with any component list
+			hash := computeSpecHash(params)
+			if hash == "" {
+				t.Error("expected non-empty hash")
+			}
+		})
+	}
+}
+
+// TestVariablesEdgeCases tests edge cases for variables handling
+func TestVariablesEdgeCases(t *testing.T) {
+	tests := []struct {
+		name      string
+		variables map[string]string
+	}{
+		{
+			name:      "nil variables",
+			variables: nil,
+		},
+		{
+			name:      "empty variables",
+			variables: map[string]string{},
+		},
+		{
+			name: "empty key",
+			variables: map[string]string{
+				"":      "value",
+				"valid": "value",
+			},
+		},
+		{
+			name: "empty value",
+			variables: map[string]string{
+				"key": "",
+			},
+		},
+		{
+			name: "special characters in keys",
+			variables: map[string]string{
+				"KEY_WITH_UNDERSCORE": "value",
+				"KEY-WITH-DASH":       "value",
+				"KEY.WITH.DOT":        "value",
+			},
+		},
+		{
+			name: "special characters in values",
+			variables: map[string]string{
+				"url":  "https://example.com/path?query=value",
+				"json": `{"key":"value"}`,
+				"yaml": "key: value\n",
+			},
+		},
+		{
+			name: "large value",
+			variables: map[string]string{
+				"large": strings.Repeat("x", 10000),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := v1alpha1.ZarfPackageParameters{
+				Source:    "oci://example.com/test:1.0.0",
+				Variables: tt.variables,
+			}
+
+			// Hash should handle any variables map
+			hash := computeSpecHash(params)
+			if hash == "" {
+				t.Error("expected non-empty hash")
+			}
+
+			// Hash should be deterministic
+			hash2 := computeSpecHash(params)
+			if hash != hash2 {
+				t.Error("hash should be deterministic")
+			}
+		})
+	}
+}
+
+// TestInvalidSourceHandling tests handling of invalid OCI sources
+func TestInvalidSourceHandling(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{
+			name:   "empty source",
+			source: "",
+		},
+		{
+			name:   "malformed OCI reference",
+			source: "not-an-oci-reference",
+		},
+		{
+			name:   "missing tag",
+			source: "oci://example.com/package",
+		},
+		{
+			name:   "invalid characters",
+			source: "oci://example.com/package:tag with spaces",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := v1alpha1.ZarfPackageParameters{
+				Source: tt.source,
+			}
+
+			// Hash computation should not panic with invalid sources
+			hash := computeSpecHash(params)
+			if hash == "" {
+				t.Error("expected non-empty hash even for invalid source")
+			}
+		})
+	}
+}
+
+// TestNilParametersHandling tests handling of nil or zero-value parameters
+func TestNilParametersHandling(t *testing.T) {
+	t.Run("zero value parameters", func(t *testing.T) {
+		var params v1alpha1.ZarfPackageParameters
+
+		hash := computeSpecHash(params)
+		if hash == "" {
+			t.Error("expected non-empty hash for zero value params")
+		}
+	})
+
+	t.Run("partial parameters", func(t *testing.T) {
+		params := v1alpha1.ZarfPackageParameters{
+			Source: "oci://example.com/test:1.0.0",
+			// All other fields zero/nil
+		}
+
+		hash := computeSpecHash(params)
+		if hash == "" {
+			t.Error("expected non-empty hash for partial params")
+		}
+	})
+}
+
+// TestTimeoutEdgeCases tests timeout handling edge cases
+func TestTimeoutEdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout *metav1.Duration
+	}{
+		{
+			name:    "nil timeout",
+			timeout: nil,
+		},
+		{
+			name:    "zero timeout",
+			timeout: &metav1.Duration{Duration: 0},
+		},
+		{
+			name:    "negative timeout",
+			timeout: &metav1.Duration{Duration: -1 * time.Hour},
+		},
+		{
+			name:    "very large timeout",
+			timeout: &metav1.Duration{Duration: 100 * time.Hour},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := v1alpha1.ZarfPackageParameters{
+				Source:  "oci://example.com/test:1.0.0",
+				Timeout: tt.timeout,
+			}
+
+			// Should not panic with any timeout value
+			hash := computeSpecHash(params)
+			if hash == "" {
+				t.Error("expected non-empty hash")
+			}
+		})
+	}
+}

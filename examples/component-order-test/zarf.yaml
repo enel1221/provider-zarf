@@ -1,0 +1,34 @@
+kind: ZarfPackageConfig
+metadata:
+  name: component-order-test
+  description: Test package for verifying component deployment order
+  version: 0.1.0
+  architecture: multi
+
+components:
+  - name: component-c
+    description: Third component in definition order, should deploy last when requested
+    required: false
+    manifests:
+      - name: order-marker-c
+        namespace: component-order-test
+        files:
+          - configmap-c.yaml
+
+  - name: component-b
+    description: Second component in definition order, should deploy second when requested
+    required: false
+    manifests:
+      - name: order-marker-b
+        namespace: component-order-test
+        files:
+          - configmap-b.yaml
+
+  - name: component-a
+    description: First component in definition order, should deploy first when requested
+    required: false
+    manifests:
+      - name: order-marker-a
+        namespace: component-order-test
+        files:
+          - configmap-a.yaml

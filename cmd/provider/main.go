@@ -56,6 +56,7 @@ func main() {
 	var (
 		app            = kingpin.New(filepath.Base(os.Args[0]), "Zarf support for Crossplane.").DefaultEnvars()
 		debug          = app.Flag("debug", "Run with debug logging.").Short('d').Bool()
+		logLevel       = app.Flag("log-level", "Log level (debug, info, warn, error). Overrides --debug flag.").Default("info").Envar("ZARF_LOG_LEVEL").String()
 		leaderElection = app.Flag("leader-election", "Use leader election for the controller manager.").Short('l').Default("false").Envar("LEADER_ELECTION").Bool()
 
 		syncInterval            = app.Flag("sync", "How often all resources will be double-checked for drift from the desired state.").Short('s').Default("1h").Duration()
@@ -72,17 +73,22 @@ func main() {
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	zl := zap.New(zap.UseDevMode(*debug))
+	// Determine log level - --debug flag overrides ZARF_LOG_LEVEL
+	isDebugMode := *debug || *logLevel == "debug"
+
+	zl := zap.New(zap.UseDevMode(isDebugMode))
 	log := logging.NewLogrLogger(zl.WithName("provider-zarf"))
-	if *debug {
+	if isDebugMode {
 		// The controller-runtime is *very* verbose even at info level, so we only
 		// provide it a real logger when we're running in debug mode.
 		ctrl.SetLogger(zl)
+		log.Info("Debug logging enabled", "logLevel", *logLevel)
 	} else {
 		// Setting the controller-runtime logger to a no-op logger by default. This
 		// is not really needed, but otherwise we get a warning from the
 		// controller-runtime.
 		ctrl.SetLogger(zap.New(zap.WriteTo(io.Discard)))
+		log.Info("Provider starting", "logLevel", *logLevel)
 	}
 
 	cfg, err := ctrl.GetConfig()

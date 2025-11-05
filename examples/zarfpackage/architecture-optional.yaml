@@ -1,0 +1,33 @@
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: architecture-auto-detect-example
+  namespace: default
+spec:
+  forProvider:
+    # Source OCI reference - this is the only required field
+    source: "oci://ghcr.io/defenseunicorns/packages/init:v0.40.1"
+    
+    # Architecture field is OPTIONAL - if not specified, it will be auto-detected
+    # from the cluster's node labels (kubernetes.io/arch)
+    # 
+    # The provider will:
+    # 1. Query cluster nodes for architecture labels
+    # 2. Use the majority architecture from schedulable nodes
+    # 3. Default to amd64 if no labels found
+    #
+    # Uncomment to explicitly set architecture:
+    # architecture: "amd64"  # Options: amd64, arm64
+    
+    # Optional: select specific components
+    components:
+      - "zarf-agent"
+      - "zarf-seed-registry"
+    
+    # Optional: configure deployment
+    namespace: "zarf"
+    timeout:
+      duration: "15m"
+    
+  providerConfigRef:
+    name: default

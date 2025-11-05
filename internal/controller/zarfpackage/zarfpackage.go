@@ -553,9 +553,46 @@ func (c *external) detectClusterArchitecture(ctx context.Context) (string, error
 		return defaultArchitecture, nil
 	}
 
+	archCounts, schedulableNodes := c.countNodeArchitectures(nodeList.Items)
+
+	if schedulableNodes == 0 {
+		c.logger.V(1).Info("No schedulable nodes found, defaulting to amd64")
+		return defaultArchitecture, nil
+	}
+
+	if len(archCounts) == 0 {
+		c.logger.V(1).Info("No architecture labels found on schedulable nodes, defaulting to amd64")
+		return defaultArchitecture, nil
+	}
+
+	majorityArch := findMajorityArchitecture(archCounts)
+
+	c.logger.V(1).Info("Detected cluster architecture from node labels",
+		"architecture", majorityArch,
+		"schedulableNodeCount", archCounts[majorityArch],
+		"totalSchedulableNodes", schedulableNodes,
+		"totalNodes", len(nodeList.Items))
+
+	return majorityArch, nil
+}
+
+// countNodeArchitectures counts architecture labels across schedulable nodes.
+// Returns a map of architecture -> count and the total number of schedulable nodes.
+func (c *external) countNodeArchitectures(nodes []corev1.Node) (map[string]int, int) {
 	archCounts := make(map[string]int)
-	for i := range nodeList.Items {
-		node := &nodeList.Items[i]
+	schedulableNodes := 0
+
+	for i := range nodes {
+		node := &nodes[i]
+
+		// Skip unschedulable nodes as per requirements
+		if node.Spec.Unschedulable {
+			c.logger.V(1).Info("Skipping unschedulable node for architecture detection", "node", node.Name)
+			continue
+		}
+
+		schedulableNodes++
+
 		// Check standard label first, fall back to deprecated beta label
 		arch := node.Labels["kubernetes.io/arch"]
 		if arch == "" {
@@ -566,12 +603,11 @@ func (c *external) detectClusterArchitecture(ctx context.Context) (string, error
 		}
 	}
 
-	if len(archCounts) == 0 {
-		c.logger.V(1).Info("No architecture labels found on nodes, defaulting to amd64")
-		return defaultArchitecture, nil
-	}
+	return archCounts, schedulableNodes
+}
 
-	// Find the most common architecture
+// findMajorityArchitecture returns the architecture with the highest count.
+func findMajorityArchitecture(archCounts map[string]int) string {
 	var majorityArch string
 	var maxCount int
 	for arch, count := range archCounts {
@@ -580,13 +616,7 @@ func (c *external) detectClusterArchitecture(ctx context.Context) (string, error
 			majorityArch = arch
 		}
 	}
-
-	c.logger.V(1).Info("Detected cluster architecture from node labels",
-		"architecture", majorityArch,
-		"nodeCount", maxCount,
-		"totalNodes", len(nodeList.Items))
-
-	return majorityArch, nil
+	return majorityArch
 }
 
 func (c *external) resolveRegistryDockerConfig(ctx context.Context, cr *v1alpha1.ZarfPackage) ([]byte, error) {

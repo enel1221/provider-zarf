@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-marker-b
+  namespace: component-order-test
+  labels:
+    test: component-order
+    component: b
+    order: "2"
+data:
+  component: "b"
+  message: "Component B deployed"
+  timestamp: "will-be-set-by-controller"

@@ -1,7 +1,7 @@
 apiVersion: pkg.crossplane.io/v1beta1
 kind: DeploymentRuntimeConfig
 metadata:
-  name: provider-zarf-runtime
+  name: provider-zarf-runtime-production
 spec:
   deploymentTemplate:
     metadata:
@@ -18,22 +18,17 @@ spec:
         spec:
           containers:
           - name: package-runtime
-            args: ["--debug"]
+            # Production configuration with info-level logging
             env:
             - name: ZARF_BYPASS
               value: "true"
-            # Enable debug logging for Crossplane provider
-            - name: CROSSPLANE_DEBUG
-              value: "true"
-            - name: CROSSPLANE_LOG_LEVEL
-              value: "debug"
-            # Enable detailed Zarf logging
-            # Options: debug, info (default), warn, error
-            # debug: Shows Zarf library internals, component filtering, OCI operations
-            # info: Standard operational logs with package status (recommended for production)
-            # Use 00-runtime-config-production.yaml for production deployments
+            # Set log level to info for production (options: debug, info, warn, error)
+            # - debug: Verbose Zarf library logs, detailed reconciliation steps
+            # - info: Standard operational logs (default, recommended for production)
+            # - warn: Only warnings and errors
+            # - error: Only errors
             - name: ZARF_LOG_LEVEL
-              value: "debug"
+              value: "info"
             volumeMounts:
             - name: tmp-storage
               mountPath: /tmp

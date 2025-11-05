@@ -49,6 +49,7 @@ import (
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	// Zarf library imports
+	"github.com/zarf-dev/zarf/src/api/v1alpha1"
 	"github.com/zarf-dev/zarf/src/config"
 	"github.com/zarf-dev/zarf/src/pkg/cluster"
 	"github.com/zarf-dev/zarf/src/pkg/logger"
@@ -135,7 +136,8 @@ func (w *logrSlogBridge) Write(p []byte) (n int, err error) {
 		// JSON format from slog - extract level
 		switch {
 		case strings.Contains(msg, `"level":"DEBUG"`) || strings.Contains(msg, `"level":"debug"`):
-			w.logger.Info(msg, "level", "DEBUG")
+			// Map DEBUG to V(1) so it only appears when log level is set to debug
+			w.logger.V(1).Info(msg)
 		case strings.Contains(msg, `"level":"ERROR"`) || strings.Contains(msg, `"level":"error"`):
 			w.logger.Error(nil, msg)
 		case strings.Contains(msg, `"level":"WARN"`) || strings.Contains(msg, `"level":"warn"`):
@@ -339,11 +341,42 @@ func configureDockerCredentials(configJSON []byte, l *slog.Logger) (func(), erro
 	return cleanup, nil
 }
 
+// buildComponentFilter creates a filter that preserves the user's requested component order.
+// Unlike filters.BySelectState which returns components in package definition order,
+// this filter returns components in the exact order specified by the user.
 func buildComponentFilter(components []string) filters.ComponentFilterStrategy {
 	if len(components) == 0 {
 		return filters.Empty()
 	}
-	return filters.BySelectState(strings.Join(components, ","))
+	return &orderedComponentFilter{requestedComponents: components}
+}
+
+// orderedComponentFilter preserves the user's requested component order.
+type orderedComponentFilter struct {
+	requestedComponents []string
+}
+
+// Apply filters and orders components according to the user's requested order.
+// Components are returned in the exact order specified in requestedComponents.
+func (f *orderedComponentFilter) Apply(pkg v1alpha1.ZarfPackage) ([]v1alpha1.ZarfComponent, error) {
+	// Build a map of component name → component for O(1) lookup
+	componentMap := make(map[string]v1alpha1.ZarfComponent, len(pkg.Components))
+	for _, comp := range pkg.Components {
+		componentMap[comp.Name] = comp
+	}
+
+	// Build result in the user's requested order
+	result := make([]v1alpha1.ZarfComponent, 0, len(f.requestedComponents))
+	for _, requestedName := range f.requestedComponents {
+		if comp, found := componentMap[requestedName]; found {
+			result = append(result, comp)
+		} else {
+			// Component not found in package - return error for clear feedback
+			return nil, fmt.Errorf("requested component %q not found in package", requestedName)
+		}
+	}
+
+	return result, nil
 }
 
 func buildLoadOptions(opts DeployOptions, filter filters.ComponentFilterStrategy) packager.LoadOptions {

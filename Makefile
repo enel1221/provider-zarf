@@ -20,7 +20,7 @@ GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider
 GO_LDFLAGS += -X $(GO_PROJECT)/internal/version.Version=$(VERSION)
 GO_SUBDIRS += cmd internal apis
 GO111MODULE = on
-GOLANGCILINT_VERSION = 2.1.2
+GOLANGCILINT_VERSION = 2.5.0
 -include build/makelib/golang.mk
 
 # ====================================================================================
@@ -60,6 +60,14 @@ test-integration: $(KIND) $(KUBECTL) $(CROSSPLANE_CLI) $(HELM3)
 	@$(INFO) running integration tests using kind $(KIND_VERSION)
 	@KIND_NODE_IMAGE_TAG=${KIND_NODE_IMAGE_TAG} $(ROOT_DIR)/cluster/local/integration_tests.sh || $(FAIL)
 	@$(OK) integration tests passed
+
+# Run E2E tests for component ordering and other features
+# Prerequisites: Kubernetes cluster with Crossplane and provider-zarf installed
+# Usage: make test-e2e
+test-e2e:
+	@$(INFO) running E2E tests
+	@./test/e2e/run-e2e.sh || $(FAIL)
+	@$(OK) E2E tests passed
 
 # Update the submodules, such as the common build scripts.
 submodules:
@@ -104,7 +112,7 @@ dev-clean: $(KIND) $(KUBECTL)
 	@$(INFO) Deleting kind cluster
 	@$(KIND) delete cluster --name=$(PROJECT_NAME)-dev
 
-.PHONY: submodules fallthrough test-integration run dev dev-clean
+.PHONY: submodules fallthrough test-integration test-e2e run dev dev-clean
 
 # ====================================================================================
 # Special Targets

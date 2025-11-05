@@ -5,6 +5,41 @@ This directory contains ready-to-use `ZarfPackage` custom resources that demonst
 - `dos-games.yaml` – deploys the public DOS games demo package.
 - `bigbang.yaml` – deploys the Big Bang demo package with Crossplane management policies.
 - `private-registry.yaml` – shows how to pull a package from a private OCI registry by referencing Docker credentials via `registrySecretRef`.
+- `architecture-optional.yaml` – demonstrates architecture auto-detection (architecture field is optional).
+
+## Architecture Auto-Detection
+
+The `architecture` field is **optional** in `ZarfPackage` resources. When not specified, the provider automatically detects the cluster architecture by:
+
+1. Querying cluster nodes for `kubernetes.io/arch` labels (or fallback `beta.kubernetes.io/arch`)
+2. Using the majority architecture from schedulable nodes
+3. Defaulting to `amd64` if no labels are found or results are ambiguous
+
+**Example without architecture** (auto-detected):
+```yaml
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: my-package
+spec:
+  forProvider:
+    source: "oci://ghcr.io/org/package:v1.0.0"
+    # architecture field omitted - will auto-detect from cluster
+```
+
+**Example with explicit architecture**:
+```yaml
+apiVersion: zarf.dev/v1alpha1
+kind: ZarfPackage
+metadata:
+  name: my-package
+spec:
+  forProvider:
+    source: "oci://ghcr.io/org/package:v1.0.0"
+    architecture: "arm64"  # Explicit override
+```
+
+See `architecture-optional.yaml` for a complete example with detailed comments.
 
 ## Pulling packages from a private registry
 
