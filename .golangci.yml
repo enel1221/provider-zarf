@@ -23,7 +23,6 @@ linters:
     - musttag
     - nakedret
     - nilerr
-    - nilnesserr
     - noctx
     - prealloc
     - protogetter

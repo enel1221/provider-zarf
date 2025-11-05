@@ -30,6 +30,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,8 +44,14 @@ import (
 
 var testScheme = runtime.NewScheme()
 
+const (
+	testArchAmd64 = "amd64"
+	testArchArm64 = "arm64"
+)
+
 func init() {
 	_ = v1alpha1.SchemeBuilder.AddToScheme(testScheme)
+	_ = corev1.AddToScheme(testScheme)
 }
 
 // newExternalForTest creates an external client with all required fields for testing.
@@ -542,5 +549,151 @@ func TestUpdateNoChange(t *testing.T) {
 	}
 	if deployCalled {
 		t.Fatalf("expected no deployment when spec hash unchanged")
+	}
+}
+
+// TestDetectClusterArchitectureAmd64 verifies auto-detection returns amd64 for amd64 nodes.
+func TestDetectClusterArchitectureAmd64(t *testing.T) {
+	nodes := []client.Object{
+		nodeWithArch("node1", testArchAmd64),
+		nodeWithArch("node2", testArchAmd64),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(nodes...).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	arch, err := e.detectClusterArchitecture(context.Background())
+	if err != nil {
+		t.Fatalf("detectClusterArchitecture failed: %v", err)
+	}
+	if arch != testArchAmd64 {
+		t.Errorf("expected amd64, got %s", arch)
+	}
+}
+
+// TestDetectClusterArchitectureArm64 verifies auto-detection returns arm64 for arm64 nodes.
+func TestDetectClusterArchitectureArm64(t *testing.T) {
+	nodes := []client.Object{
+		nodeWithArch("node1", testArchArm64),
+		nodeWithArch("node2", testArchArm64),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(nodes...).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	arch, err := e.detectClusterArchitecture(context.Background())
+	if err != nil {
+		t.Fatalf("detectClusterArchitecture failed: %v", err)
+	}
+	if arch != testArchArm64 {
+		t.Errorf("expected arm64, got %s", arch)
+	}
+}
+
+// TestDetectClusterArchitectureMixed verifies majority wins in mixed architecture clusters.
+func TestDetectClusterArchitectureMixed(t *testing.T) {
+	nodes := []client.Object{
+		nodeWithArch("node1", testArchAmd64),
+		nodeWithArch("node2", testArchAmd64),
+		nodeWithArch("node3", testArchArm64),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(nodes...).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	arch, err := e.detectClusterArchitecture(context.Background())
+	if err != nil {
+		t.Fatalf("detectClusterArchitecture failed: %v", err)
+	}
+	if arch != testArchAmd64 {
+		t.Errorf("expected amd64 (majority), got %s", arch)
+	}
+}
+
+// TestDetectClusterArchitectureNoNodes verifies default amd64 when no nodes exist.
+func TestDetectClusterArchitectureNoNodes(t *testing.T) {
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	arch, err := e.detectClusterArchitecture(context.Background())
+	if err != nil {
+		t.Fatalf("detectClusterArchitecture failed: %v", err)
+	}
+	if arch != testArchAmd64 {
+		t.Errorf("expected amd64 default, got %s", arch)
+	}
+}
+
+// TestDetectClusterArchitectureNoLabels verifies default amd64 when nodes lack arch labels.
+func TestDetectClusterArchitectureNoLabels(t *testing.T) {
+	nodes := []client.Object{
+		nodeWithArch("node1", ""), // No arch label
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(nodes...).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	arch, err := e.detectClusterArchitecture(context.Background())
+	if err != nil {
+		t.Fatalf("detectClusterArchitecture failed: %v", err)
+	}
+	if arch != testArchAmd64 {
+		t.Errorf("expected amd64 default when no labels, got %s", arch)
+	}
+}
+
+// TestBuildDeployOptionsExplicitArch verifies explicit architecture overrides auto-detection.
+func TestBuildDeployOptionsExplicitArch(t *testing.T) {
+	nodes := []client.Object{
+		nodeWithArch("node1", testArchAmd64),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(nodes...).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	pkg := &v1alpha1.ZarfPackage{
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source:       "oci://example.com/test:1.0.0",
+				Architecture: testArchArm64, // Explicit override
+			},
+		},
+	}
+
+	opts := e.buildDeployOptions(context.Background(), pkg, 15*time.Minute, nil, "testhash")
+	if opts.Architecture != testArchArm64 {
+		t.Errorf("expected explicit arm64, got %s", opts.Architecture)
+	}
+}
+
+// TestBuildDeployOptionsAutoDetect verifies auto-detection when architecture is empty.
+func TestBuildDeployOptionsAutoDetect(t *testing.T) {
+	nodes := []client.Object{
+		nodeWithArch("node1", testArchArm64),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(nodes...).Build()
+	e := newExternalForTest(&zarfclient.MockClient{}, fakeClient)
+
+	pkg := &v1alpha1.ZarfPackage{
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source:       "oci://example.com/test:1.0.0",
+				Architecture: "", // Empty triggers auto-detection
+			},
+		},
+	}
+
+	opts := e.buildDeployOptions(context.Background(), pkg, 15*time.Minute, nil, "testhash")
+	if opts.Architecture != testArchArm64 {
+		t.Errorf("expected auto-detected arm64, got %s", opts.Architecture)
+	}
+}
+
+// nodeWithArch is a test helper that creates a Node with architecture label.
+func nodeWithArch(name, arch string) *corev1.Node {
+	labels := make(map[string]string)
+	if arch != "" {
+		labels["kubernetes.io/arch"] = arch
+	}
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
 	}
 }

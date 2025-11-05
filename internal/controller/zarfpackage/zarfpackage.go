@@ -143,7 +143,10 @@ func (dt *deploymentTracker) untrack(uid types.UID) {
 }
 
 // isTracked returns true if a deployment is currently in progress for the given UID.
-const defaultRegistrySecretNamespace = "crossplane-system"
+const (
+	defaultRegistrySecretNamespace = "crossplane-system" //nolint:gosec // Not a credential
+	defaultArchitecture            = "amd64"
+)
 
 // Global deployment tracker shared across all external clients
 var globalDeploymentTracker = newDeploymentTracker()
@@ -482,7 +485,7 @@ func (c *external) startBackgroundDeployment(ctx context.Context, cr *v1alpha1.Z
 		return managed.ExternalCreation{}, wrapped
 	}
 	desiredHash := computeSpecHash(cr.Spec.ForProvider)
-	opts := c.buildDeployOptions(cr, deployTimeout, registryConfig, desiredHash)
+	opts := c.buildDeployOptions(ctx, cr, deployTimeout, registryConfig, desiredHash)
 
 	// Start deployment goroutine
 	// Note: We pass ctx for linting but use background context inside the goroutine
@@ -506,13 +509,26 @@ func (c *external) getDeployTimeout(cr *v1alpha1.ZarfPackage) time.Duration {
 }
 
 // buildDeployOptions constructs deployment options from the resource spec.
-func (c *external) buildDeployOptions(cr *v1alpha1.ZarfPackage, deployTimeout time.Duration, registryDockerConfig []byte, specHash string) zarfclient.DeployOptions {
+func (c *external) buildDeployOptions(ctx context.Context, cr *v1alpha1.ZarfPackage, deployTimeout time.Duration, registryDockerConfig []byte, specHash string) zarfclient.DeployOptions {
+	arch := cr.Spec.ForProvider.Architecture
+	if strings.TrimSpace(arch) == "" {
+		// Auto-detect architecture from cluster nodes if not explicitly set
+		detected, err := c.detectClusterArchitecture(ctx)
+		if err != nil {
+			c.logger.V(1).Info("Failed to detect cluster architecture, defaulting to amd64", "error", err)
+			arch = defaultArchitecture
+		} else {
+			arch = detected
+			c.logger.V(1).Info("Auto-detected cluster architecture", "architecture", arch)
+		}
+	}
+
 	return zarfclient.DeployOptions{
 		Source:                   cr.Spec.ForProvider.Source,
 		Namespace:                cr.Spec.ForProvider.Namespace,
 		Components:               cr.Spec.ForProvider.Components,
 		Variables:                cr.Spec.ForProvider.Variables,
-		Architecture:             cr.Spec.ForProvider.Architecture,
+		Architecture:             arch,
 		Retries:                  cr.Spec.ForProvider.Retries,
 		Timeout:                  &deployTimeout,
 		AdoptExisting:            cr.Spec.ForProvider.AdoptExistingResources,
@@ -522,6 +538,55 @@ func (c *external) buildDeployOptions(cr *v1alpha1.ZarfPackage, deployTimeout ti
 		RegistryDockerConfigJSON: registryDockerConfig,
 		DesiredSpecHash:          specHash,
 	}
+}
+
+// detectClusterArchitecture queries cluster nodes to determine the majority architecture.
+// Returns "amd64" or "arm64" based on node labels, defaults to "amd64" if no nodes found.
+func (c *external) detectClusterArchitecture(ctx context.Context) (string, error) {
+	nodeList := &corev1.NodeList{}
+	if err := c.kube.List(ctx, nodeList); err != nil {
+		return "", fmt.Errorf("failed to list cluster nodes: %w", err)
+	}
+
+	if len(nodeList.Items) == 0 {
+		c.logger.V(1).Info("No nodes found in cluster, defaulting to amd64")
+		return defaultArchitecture, nil
+	}
+
+	archCounts := make(map[string]int)
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		// Check standard label first, fall back to deprecated beta label
+		arch := node.Labels["kubernetes.io/arch"]
+		if arch == "" {
+			arch = node.Labels["beta.kubernetes.io/arch"]
+		}
+		if arch != "" {
+			archCounts[arch]++
+		}
+	}
+
+	if len(archCounts) == 0 {
+		c.logger.V(1).Info("No architecture labels found on nodes, defaulting to amd64")
+		return defaultArchitecture, nil
+	}
+
+	// Find the most common architecture
+	var majorityArch string
+	var maxCount int
+	for arch, count := range archCounts {
+		if count > maxCount {
+			maxCount = count
+			majorityArch = arch
+		}
+	}
+
+	c.logger.V(1).Info("Detected cluster architecture from node labels",
+		"architecture", majorityArch,
+		"nodeCount", maxCount,
+		"totalNodes", len(nodeList.Items))
+
+	return majorityArch, nil
 }
 
 func (c *external) resolveRegistryDockerConfig(ctx context.Context, cr *v1alpha1.ZarfPackage) ([]byte, error) {
@@ -773,7 +838,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalUpdate{}, wrapped
 	}
 
-	opts := c.buildDeployOptions(cr, deployTimeout, registryConfig, desiredHash)
+	opts := c.buildDeployOptions(ctx, cr, deployTimeout, registryConfig, desiredHash)
 	c.logger.Info("Redeploying Zarf package to apply spec changes", "packageName", packageName, "desiredHash", desiredHash, "currentHash", currentHash)
 	c.recorder.Event(cr, event.Normal("Redeploying", fmt.Sprintf("Redeploying Zarf package %s to apply spec changes", packageName)))
 
