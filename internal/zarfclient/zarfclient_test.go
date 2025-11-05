@@ -2,7 +2,6 @@ package zarfclient
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -237,13 +236,15 @@ func TestLogrSlogBridgeLevels(t *testing.T) {
 	}
 }
 
-// TestLogrSlogBridgeWarnPrefix tests that WARN logs get the "WARN:" prefix.
+// TestLogrSlogBridgeWarnPrefix tests that WARN logs include level as a structured field.
 func TestLogrSlogBridgeWarnPrefix(t *testing.T) {
-	// Create a simple logger that captures messages
+	// Create a simple logger that captures messages and key-value pairs
 	var lastMessage string
+	var lastKVPairs []interface{}
 	logger := logr.New(&testLogSink{
 		infoFunc: func(level int, msg string, keysAndValues ...interface{}) {
 			lastMessage = msg
+			lastKVPairs = keysAndValues
 		},
 	})
 
@@ -255,8 +256,21 @@ func TestLogrSlogBridgeWarnPrefix(t *testing.T) {
 		t.Fatalf("Write failed: %v", err)
 	}
 
-	if !strings.HasPrefix(lastMessage, "WARN:") {
-		t.Errorf("expected WARN log to have 'WARN:' prefix, got: %s", lastMessage)
+	// Check that message is just the message (no prefix)
+	if lastMessage != "warning message" {
+		t.Errorf("expected message to be 'warning message', got: %s", lastMessage)
+	}
+
+	// Check that "level" and "WARN" are in the key-value pairs
+	foundLevel := false
+	for i := 0; i < len(lastKVPairs)-1; i += 2 {
+		if lastKVPairs[i] == "level" && lastKVPairs[i+1] == "WARN" {
+			foundLevel = true
+			break
+		}
+	}
+	if !foundLevel {
+		t.Errorf("expected key-value pairs to contain level=WARN, got: %v", lastKVPairs)
 	}
 }
 

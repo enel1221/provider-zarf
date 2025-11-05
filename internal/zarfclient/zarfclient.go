@@ -35,6 +35,7 @@ package zarfclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -125,32 +126,84 @@ type logrSlogBridge struct {
 }
 
 // Write implements io.Writer to capture slog JSON output and forward to logr.
+// Parses JSON output from Zarf's slog handler and extracts structured fields
+// to pass as logr key-value pairs instead of logging raw JSON strings.
 func (w *logrSlogBridge) Write(p []byte) (n int, err error) {
 	msg := strings.TrimSpace(string(p))
 	if msg == "" {
 		return len(p), nil
 	}
 
-	// Parse JSON output from slog and route to appropriate logr level
+	// Try to parse as JSON from slog
 	if strings.HasPrefix(msg, "{") {
-		// JSON format from slog - extract level
-		switch {
-		case strings.Contains(msg, `"level":"DEBUG"`) || strings.Contains(msg, `"level":"debug"`):
-			// Map DEBUG to V(1) so it only appears when log level is set to debug
-			w.logger.V(1).Info(msg)
-		case strings.Contains(msg, `"level":"ERROR"`) || strings.Contains(msg, `"level":"error"`):
-			w.logger.Error(nil, msg)
-		case strings.Contains(msg, `"level":"WARN"`) || strings.Contains(msg, `"level":"warn"`):
-			w.logger.Info("WARN: " + msg)
-		default:
-			// INFO or unknown level
-			w.logger.Info(msg)
+		if w.tryLogJSON(msg) {
+			return len(p), nil
 		}
-	} else {
-		// Plain text message
-		w.logger.Info(msg)
+		// If JSON parsing failed, fall through to plain text handling
 	}
+
+	// Plain text message - log as-is
+	w.logger.Info(msg)
 	return len(p), nil
+}
+
+// tryLogJSON attempts to parse msg as JSON and log it with structured fields.
+// Returns true if successful, false if JSON parsing failed.
+func (w *logrSlogBridge) tryLogJSON(msg string) bool {
+	var record map[string]interface{}
+	if err := json.Unmarshal([]byte(msg), &record); err != nil {
+		return false
+	}
+
+	// Successfully parsed JSON - extract standard fields
+	level := getStringField(record, "level")
+	message := getStringField(record, "msg")
+
+	// Build key-value pairs from remaining fields (excluding time, level, msg)
+	kvPairs := extractKeyValuePairs(record)
+
+	// Route to appropriate log level with structured fields
+	w.logAtLevel(level, message, kvPairs)
+	return true
+}
+
+// logAtLevel routes the message to the appropriate log level.
+func (w *logrSlogBridge) logAtLevel(level, message string, kvPairs []interface{}) {
+	switch strings.ToUpper(level) {
+	case "DEBUG":
+		// Map DEBUG to V(1) so it only appears when log level is set to debug
+		w.logger.V(1).Info(message, kvPairs...)
+	case "ERROR":
+		w.logger.Error(nil, message, kvPairs...)
+	case "WARN", "WARNING":
+		// Include level as a field for warnings
+		kvPairs = append([]interface{}{"level", "WARN"}, kvPairs...)
+		w.logger.Info(message, kvPairs...)
+	default:
+		// INFO or unknown level
+		w.logger.Info(message, kvPairs...)
+	}
+}
+
+// extractKeyValuePairs builds a key-value slice from a map, excluding time, level, and msg fields.
+func extractKeyValuePairs(record map[string]interface{}) []interface{} {
+	var kvPairs []interface{}
+	for k, v := range record {
+		if k != "time" && k != "level" && k != "msg" {
+			kvPairs = append(kvPairs, k, v)
+		}
+	}
+	return kvPairs
+}
+
+// getStringField extracts a string value from a map, returning empty string if not found or not a string.
+func getStringField(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 // =============================================================================

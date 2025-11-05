@@ -395,7 +395,10 @@ func (c *external) handleInstalled(cr *v1alpha1.ZarfPackage, packageName string)
 		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: false}, nil
 	}
 
-	cr.Status.AtProvider.LastAppliedSpecHash = desiredHash
+	// DO NOT update LastAppliedSpecHash here - it should only be updated:
+	// 1. When initially empty (line 386 above)
+	// 2. After successful deployment (in applyDeploymentSuccessStatus)
+	// Updating it here causes infinite redeploy loops because status updates trigger reconciliation
 
 	c.logger.Info("Package installed", "packageName", packageName)
 	cr.Status.AtProvider.PackageName = packageName

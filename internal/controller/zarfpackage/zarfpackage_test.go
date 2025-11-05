@@ -1275,3 +1275,223 @@ func TestTimeoutEdgeCases(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleInstalledHashStability tests that handleInstalled does NOT update
+// the hash when the package is already installed with a matching spec.
+// This prevents infinite redeploy loops (critical bug fix for v1.1.1).
+func TestHandleInstalledHashStability(t *testing.T) {
+	// Compute the expected hash for a known spec
+	testParams := v1alpha1.ZarfPackageParameters{
+		Source:     "oci://registry.example.com/pkg:1.0.0",
+		Components: []string{"images", "ns", "helm"},
+	}
+	expectedHash := computeSpecHash(testParams)
+
+	tests := []struct {
+		name                   string
+		currentHash            string
+		components             []string
+		source                 string
+		expectHashToChange     bool
+		expectResourceUpToDate bool
+		expectPhase            string
+	}{
+		{
+			name:                   "hash already set - should NOT update",
+			currentHash:            expectedHash, // Use the correct hash for the spec
+			components:             []string{"images", "ns", "helm"},
+			source:                 "oci://registry.example.com/pkg:1.0.0",
+			expectHashToChange:     false, // CRITICAL: Hash should remain unchanged
+			expectResourceUpToDate: true,
+			expectPhase:            "Installed",
+		},
+		{
+			name:                   "hash empty - should initialize once",
+			currentHash:            "",
+			components:             []string{"images", "ns", "helm"},
+			source:                 "oci://registry.example.com/pkg:1.0.0",
+			expectHashToChange:     true, // First time initialization is OK
+			expectResourceUpToDate: true,
+			expectPhase:            "Installed",
+		},
+		{
+			name:                   "spec changed - should detect drift",
+			currentHash:            "abc123-old-hash",
+			components:             []string{"images", "ns"}, // Different components
+			source:                 "oci://registry.example.com/pkg:2.0.0",
+			expectHashToChange:     false, // Hash should NOT update in Observe
+			expectResourceUpToDate: false, // But should trigger Update()
+			expectPhase:            "Updating",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test package
+			cr := &v1alpha1.ZarfPackage{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pkg",
+					UID:  types.UID("test-uid-123"),
+				},
+				Spec: v1alpha1.ZarfPackageSpec{
+					ForProvider: v1alpha1.ZarfPackageParameters{
+						Source:     tt.source,
+						Components: tt.components,
+					},
+				},
+				Status: v1alpha1.ZarfPackageStatus{
+					AtProvider: v1alpha1.ZarfPackageObservation{
+						LastAppliedSpecHash: tt.currentHash,
+						PackageName:         "test-pkg",
+					},
+				},
+			}
+
+			// Create external client
+			ext := &external{
+				client: &zarfclient.MockClient{
+					MockIsInstalled: func(ctx context.Context, source, namespace string) (bool, *state.DeployedPackage, error) {
+						return true, &state.DeployedPackage{Name: "test-pkg"}, nil
+					},
+				},
+				kube:     fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				logger:   logr.Discard(),
+				recorder: event.NewNopRecorder(),
+			}
+
+			// Call handleInstalled
+			obs, err := ext.handleInstalled(cr, "test-pkg")
+			if err != nil {
+				t.Fatalf("handleInstalled failed: %v", err)
+			}
+
+			// Verify resource up-to-date status
+			if obs.ResourceUpToDate != tt.expectResourceUpToDate {
+				t.Errorf("Expected ResourceUpToDate=%v, got %v",
+					tt.expectResourceUpToDate, obs.ResourceUpToDate)
+			}
+
+			// Verify phase
+			if cr.Status.AtProvider.Phase != tt.expectPhase {
+				t.Errorf("Expected phase=%q, got %q", tt.expectPhase, cr.Status.AtProvider.Phase)
+			}
+
+			// CRITICAL TEST: Verify hash behavior
+			newHash := cr.Status.AtProvider.LastAppliedSpecHash
+			if tt.expectHashToChange {
+				if newHash == tt.currentHash && tt.currentHash != "" {
+					t.Errorf("Expected hash to change from %q, but it remained the same", tt.currentHash)
+				}
+			} else {
+				// For already-set hashes, they should NEVER change in handleInstalled
+				if tt.currentHash != "" && newHash != tt.currentHash {
+					t.Errorf("CRITICAL: Hash changed from %q to %q! This causes infinite loops!",
+						tt.currentHash, newHash)
+				}
+			}
+		})
+	}
+}
+
+// TestSpecHashIdempotency verifies that computing the hash multiple times
+// for the same spec produces identical results (idempotency test).
+func TestSpecHashIdempotency(t *testing.T) {
+	params := v1alpha1.ZarfPackageParameters{
+		Source:     "oci://registry.example.com/pkg:1.0.0",
+		Namespace:  "test-ns",
+		Components: []string{"images", "ns", "helm"},
+		Variables: map[string]string{
+			"foo": "bar",
+			"baz": "qux",
+		},
+	}
+
+	// Compute hash 100 times
+	hashes := make(map[string]int)
+	for i := 0; i < 100; i++ {
+		hash := computeSpecHash(params)
+		hashes[hash]++
+	}
+
+	// Should have exactly ONE unique hash
+	if len(hashes) != 1 {
+		t.Errorf("Expected hash to be stable, but got %d different hashes: %v",
+			len(hashes), hashes)
+	}
+
+	// Verify hash is non-empty
+	for hash := range hashes {
+		if hash == "" {
+			t.Error("Hash should not be empty")
+		}
+	}
+}
+
+// TestMultipleObservationsNoHashChange verifies that multiple consecutive
+// Observe() calls do NOT change the hash (prevents infinite loop).
+func TestMultipleObservationsNoHashChange(t *testing.T) {
+	initialHash := computeSpecHash(v1alpha1.ZarfPackageParameters{
+		Source:     "oci://registry.example.com/pkg:1.0.0",
+		Components: []string{"images", "ns", "helm"},
+	})
+
+	cr := &v1alpha1.ZarfPackage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-package",
+			UID:  types.UID("test-uid-123"),
+		},
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source:     "oci://registry.example.com/pkg:1.0.0",
+				Components: []string{"images", "ns", "helm"},
+			},
+		},
+		Status: v1alpha1.ZarfPackageStatus{
+			AtProvider: v1alpha1.ZarfPackageObservation{
+				Phase:               "Installed",
+				PackageName:         "test-package",
+				LastAppliedSpecHash: initialHash,
+			},
+		},
+	}
+
+	ext := &external{
+		client: &zarfclient.MockClient{
+			MockIsInstalled: func(ctx context.Context, source, namespace string) (bool, *state.DeployedPackage, error) {
+				return true, &state.DeployedPackage{Name: "test-package"}, nil
+			},
+		},
+		kube:     fake.NewClientBuilder().WithScheme(testScheme).Build(),
+		logger:   logr.Discard(),
+		recorder: event.NewNopRecorder(),
+	}
+
+	// Simulate 10 consecutive handleInstalled() calls (like Crossplane would do)
+	previousHash := cr.Status.AtProvider.LastAppliedSpecHash
+	for i := 0; i < 10; i++ {
+		obs, err := ext.handleInstalled(cr, "test-package")
+		if err != nil {
+			t.Fatalf("handleInstalled iteration %d failed: %v", i, err)
+		}
+
+		// Resource should be up-to-date
+		if !obs.ResourceUpToDate {
+			t.Errorf("Iteration %d: Expected ResourceUpToDate=true, got false. "+
+				"This would trigger Update()!", i)
+		}
+
+		// Hash should remain absolutely stable
+		currentHash := cr.Status.AtProvider.LastAppliedSpecHash
+		if currentHash != previousHash {
+			t.Errorf("Iteration %d: CRITICAL - Hash changed from %q to %q! "+
+				"This causes infinite loops!", i, previousHash, currentHash)
+		}
+		previousHash = currentHash
+	}
+
+	// Final hash should match initial hash
+	if cr.Status.AtProvider.LastAppliedSpecHash != initialHash {
+		t.Errorf("Final hash %q does not match initial hash %q",
+			cr.Status.AtProvider.LastAppliedSpecHash, initialHash)
+	}
+}

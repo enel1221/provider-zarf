@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2025-01-XX
+
+### Fixed
+- **CRITICAL BUG**: Fixed infinite redeploy loop affecting all ZarfPackages after installation
+  - **Root Cause**: `handleInstalled()` was unconditionally updating `LastAppliedSpecHash` on every observation, triggering continuous deployment churn
+  - **Impact**: All installed packages would repeatedly cycle between "DeploymentCancelled" and "Redeploying" states
+  - **Fix**: Removed line 398 that caused hash updates during observation - hash now only updates on initial creation or after successful deployment
+  - **Prevention**: Added comprehensive unit tests to ensure hash stability across multiple observations
+- **Log Formatting**: Fixed Zarf library logs appearing as raw JSON strings
+  - **Issue**: Logs displayed as compact JSON blobs like `{"time":"...","level":"INFO","msg":"deploying component","name":"cert-manager"}` making troubleshooting difficult
+  - **Fix**: Implemented JSON parsing in `logrSlogBridge` to extract structured fields and emit clean key-value pairs
+  - **Result**: Logs now appear as `deploying component {"name": "cert-manager"}` with proper structure
+  - **Impact**: Significantly improved operator/developer experience when debugging deployments
+
+### Added
+- Unit test `TestHandleInstalledHashStability`: Validates hash doesn't change when already set and spec hasn't changed
+- Unit test `TestSpecHashIdempotency`: Verifies hash computation produces identical results across 100 iterations
+- Unit test `TestMultipleObservationsNoHashChange`: Tests 10 consecutive observations don't trigger hash changes
+- Helper functions for structured logging: `tryLogJSON()`, `logAtLevel()`, `extractKeyValuePairs()`, `getStringField()`
+
+## [1.1.0] - 2025-01-XX
+
 ### Added
 - **Architecture Auto-Detection**: ZarfPackage `architecture` field is now optional - automatically detects cluster architecture from node labels
 - **Enhanced Logging**: Support for `ZARF_LOG_LEVEL` environment variable (DEBUG, INFO, WARN, ERROR) with structured JSON logging
