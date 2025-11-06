@@ -382,9 +382,18 @@ func (c *external) handleInstalled(cr *v1alpha1.ZarfPackage, packageName string)
 	desiredHash := computeSpecHash(cr.Spec.ForProvider)
 	currentHash := strings.TrimSpace(cr.Status.AtProvider.LastAppliedSpecHash)
 
+	// If hash is empty, the package was just installed by the background goroutine.
+	// DO NOT set the hash here - it will be set by applyDeploymentSuccessStatus()
+	// when the deployment goroutine completes. Setting it here causes a status
+	// update which triggers reconciliation before deployment completes, leading
+	// to false drift detection and deployment cancellation.
 	if currentHash == "" {
-		cr.Status.AtProvider.LastAppliedSpecHash = desiredHash
-		currentHash = desiredHash
+		// Package just installed, waiting for background deployment to complete
+		c.logger.Info("Package installed but hash not yet set - deployment completing in background", "packageName", packageName)
+		cr.Status.AtProvider.PackageName = packageName
+		cr.Status.AtProvider.Phase = "Installing"
+		cr.SetConditions(xpv1.Creating())
+		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: false}, nil
 	}
 
 	if desiredHash != "" && currentHash != "" && desiredHash != currentHash {

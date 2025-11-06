@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2025-01-XX
+
+### Fixed
+- **CRITICAL BUG**: Fixed duplicate redeploy during initial ZarfPackage creation
+  - **Root Cause**: Race condition where `handleInstalled()` would initialize empty hash during `Observe()`, triggering status update → reconcile → premature `Update()` call while deployment was still in progress
+  - **Symptom**: New packages showed "DeploymentCancelled (2 times over 4 minutes)" + "Redeploying (2 times)" events within seconds of creation
+  - **Impact**: All initial deployments experienced deployment interruption and restart, causing unnecessary delays and confusion
+  - **Fix**: Removed lines 386-389 that initialized hash in `Observe()` - hash now only set by `applyDeploymentSuccessStatus()` after successful deployment
+  - **Behavior Change**: `handleInstalled()` now returns `ResourceUpToDate=false` when hash is empty, triggering proper Create/Update flow
+  - **Prevention**: Added `TestHandleInstalledEmptyHash` to validate empty hash doesn't initialize during observation
+
+### Added
+- Unit test `TestHandleInstalledEmptyHash`: Verifies empty hash doesn't get initialized in `Observe()`, preventing race condition
+
 ## [1.1.1] - 2025-01-XX
 
 ### Fixed

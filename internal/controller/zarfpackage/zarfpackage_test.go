@@ -137,6 +137,14 @@ func TestObserve(t *testing.T) {
 							Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
 						},
 					},
+					Status: v1alpha1.ZarfPackageStatus{
+						AtProvider: v1alpha1.ZarfPackageObservation{
+							// Hash must be set to simulate successfully deployed package
+							LastAppliedSpecHash: computeSpecHash(v1alpha1.ZarfPackageParameters{
+								Source: "oci://defenseunicorns/packages/dos-games:1.0.0",
+							}),
+						},
+					},
 				},
 			},
 			want: want{
@@ -1306,13 +1314,13 @@ func TestHandleInstalledHashStability(t *testing.T) {
 			expectPhase:            "Installed",
 		},
 		{
-			name:                   "hash empty - should initialize once",
+			name:                   "hash empty - should trigger update (not initialize in Observe)",
 			currentHash:            "",
 			components:             []string{"images", "ns", "helm"},
 			source:                 "oci://registry.example.com/pkg:1.0.0",
-			expectHashToChange:     true, // First time initialization is OK
-			expectResourceUpToDate: true,
-			expectPhase:            "Installed",
+			expectHashToChange:     false,        // Should NOT change in Observe
+			expectResourceUpToDate: false,        // Should trigger Create/Update to set hash
+			expectPhase:            "Installing", // Will be set to Installing to trigger deployment
 		},
 		{
 			name:                   "spec changed - should detect drift",
@@ -1493,5 +1501,54 @@ func TestMultipleObservationsNoHashChange(t *testing.T) {
 	if cr.Status.AtProvider.LastAppliedSpecHash != initialHash {
 		t.Errorf("Final hash %q does not match initial hash %q",
 			cr.Status.AtProvider.LastAppliedSpecHash, initialHash)
+	}
+}
+
+// TestHandleInstalledEmptyHash verifies that handleInstalled does NOT initialize
+// the hash during observation. This prevents the race condition where setting the
+// hash triggers a status update, causing reconciliation before the background
+// deployment completes, leading to deployment cancellation.
+func TestHandleInstalledEmptyHash(t *testing.T) {
+	cr := &v1alpha1.ZarfPackage{
+		Spec: v1alpha1.ZarfPackageSpec{
+			ForProvider: v1alpha1.ZarfPackageParameters{
+				Source: "oci://ghcr.io/enel1221/packages/cert-manager:1.16.2",
+			},
+		},
+		Status: v1alpha1.ZarfPackageStatus{
+			AtProvider: v1alpha1.ZarfPackageObservation{
+				PackageName: "cert-manager",
+				// Empty hash - package just installed by background goroutine
+				LastAppliedSpecHash: "",
+			},
+		},
+	}
+
+	ext := &external{
+		logger: logr.Discard(),
+	}
+
+	obs, err := ext.handleInstalled(cr, "cert-manager")
+
+	if err != nil {
+		t.Fatalf("handleInstalled failed: %v", err)
+	}
+
+	// Should return ResourceUpToDate=false to prevent Update() from being called
+	if obs.ResourceUpToDate {
+		t.Error("Expected ResourceUpToDate=false when hash is empty, got true. " +
+			"This would trigger Update() prematurely!")
+	}
+
+	// Hash should NOT be set - it will be set by applyDeploymentSuccessStatus()
+	if cr.Status.AtProvider.LastAppliedSpecHash != "" {
+		t.Errorf("Hash should remain empty but was set to %q. "+
+			"This causes status update and premature reconciliation!",
+			cr.Status.AtProvider.LastAppliedSpecHash)
+	}
+
+	// Phase should indicate installation in progress
+	if cr.Status.AtProvider.Phase != "Installing" {
+		t.Errorf("Expected phase Installing, got %q", cr.Status.AtProvider.Phase)
 	}
 }
