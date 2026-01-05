@@ -282,7 +282,7 @@ func setupKubeconfigFromInCluster() error {
 	if port := os.Getenv("KUBERNETES_SERVICE_PORT"); port != "" {
 		serverURL = fmt.Sprintf("https://kubernetes.default.svc:%s", port)
 	}
-	
+
 	clusterName := "in-cluster"
 	kubeconfig.Clusters[clusterName] = &clientcmdapi.Cluster{
 		Server:                   serverURL,
