@@ -32,6 +32,9 @@ GOLANGCILINT_VERSION = 2.5.0
 # Setup Images
 
 IMAGES = provider-zarf
+REGISTRY_ORGS ?= ghcr.io/enel1221
+# Include version tags (v*) in release filter for publishing
+RELEASE_BRANCH_FILTER ?= main master release-% v%
 -include build/makelib/imagelight.mk
 
 # ====================================================================================
