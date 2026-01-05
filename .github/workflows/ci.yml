@@ -260,7 +260,24 @@ jobs:
 
       - name: Publish to GHCR
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-        run: make publish BRANCH_NAME=${GITHUB_REF##*/}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF##*/}
+          
+          # Install oras for reliable OCI artifact push
+          curl -sLO https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz
+          tar -xzf oras_1.2.0_linux_amd64.tar.gz
+          chmod +x oras
+          
+          # Login to GHCR with oras
+          echo "${GHCR_TOKEN}" | ./oras login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+          # Push the xpkg as an OCI artifact  
+          echo "Pushing provider-zarf:${VERSION} to GHCR..."
+          ./oras push ghcr.io/enel1221/provider-zarf:${VERSION} \
+            _output/xpkg/linux_amd64/provider-zarf-${VERSION}.xpkg:application/vnd.cncf.crossplane.package.layer.v1.tar+gzip \
+            --config /dev/null:application/vnd.cncf.crossplane.package.v1
 
       - name: Publish Artifacts
         if: env.UPBOUND_MARKETPLACE_PUSH_ROBOT_USR != ''
