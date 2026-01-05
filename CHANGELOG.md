@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-01-05
+
+### Fixed
+- **CRITICAL BUG**: Use `kubernetes.default.svc` DNS name instead of `KUBERNETES_SERVICE_HOST` environment variable
+  - **Root Cause**: `KUBERNETES_SERVICE_HOST` may be set to `0.0.0.0` in clusters exposed to external hosts (e.g., kind), causing "context deadline exceeded" when Zarf library tries to connect
+  - **Symptom**: ZarfPackage deployments fail with "waiting for cluster connection" → "context deadline exceeded" even though kubeconfig is properly configured
+  - **Impact**: All ZarfPackage deployments failed in clusters where KUBERNETES_SERVICE_HOST=0.0.0.0
+  - **Fix**: Use `kubernetes.default.svc` cluster DNS name which always resolves correctly from within pods
+  - **Technical Details**: The kubeconfig server URL now uses `https://kubernetes.default.svc:443` instead of `https://0.0.0.0:443`
+
 ## [1.1.3] - 2026-01-05
 
 ### Fixed
