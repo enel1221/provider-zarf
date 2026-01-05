@@ -61,6 +61,15 @@ import (
 
 	// Kubernetes client
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+)
+
+var (
+	// kubeconfigSetupOnce ensures we only set up the kubeconfig once
+	kubeconfigSetupOnce sync.Once
+	// kubeconfigSetupErr stores any error from kubeconfig setup
+	kubeconfigSetupErr error
 )
 
 // =============================================================================
@@ -212,23 +221,99 @@ func getStringField(m map[string]interface{}, key string) string {
 
 const ociPrefix = "oci://"
 
-// ensureInClusterConfig configures the environment to force Zarf library to use in-cluster configuration
-// The Zarf library's ClientAndConfig() function uses clientcmd loading rules that check for kubeconfig files
-// We force it to use in-cluster config by ensuring no kubeconfig files are found
+// kubeconfigPath is the path where we write the generated kubeconfig
+const kubeconfigPath = "/tmp/zarf-provider-kubeconfig"
+
+// ensureInClusterConfig configures the environment so the Zarf library can use in-cluster credentials.
+// The Zarf library uses clientcmd.NewDefaultClientConfigLoadingRules() which expects a kubeconfig file.
+// We generate a kubeconfig file from the in-cluster service account credentials and set KUBECONFIG to point to it.
+// This makes the pod environment look like a local developer machine to the Zarf library.
 func ensureInClusterConfig() error {
-	// Unset KUBECONFIG environment variable to prevent file-based config
-	if err := os.Unsetenv("KUBECONFIG"); err != nil {
-		return fmt.Errorf("failed to unset KUBECONFIG: %w", err)
-	}
-
-	// Test that we can create in-cluster config
-	_, err := rest.InClusterConfig()
+	var err error
+	kubeconfigSetupOnce.Do(func() {
+		err = setupKubeconfigFromInCluster()
+	})
 	if err != nil {
-		return fmt.Errorf("not running in cluster or service account not configured: %w", err)
+		return err
+	}
+	return kubeconfigSetupErr
+}
+
+// setupKubeconfigFromInCluster creates a kubeconfig file from in-cluster credentials
+// and sets the KUBECONFIG environment variable to point to it.
+func setupKubeconfigFromInCluster() error {
+	// Check if we're running in a cluster
+	if _, exists := os.LookupEnv("KUBERNETES_SERVICE_HOST"); !exists {
+		// Not in a cluster, nothing to do - normal kubeconfig loading will work
+		logger.Default().Debug("Not running in cluster, using default kubeconfig loading")
+		return nil
 	}
 
-	// Use the Zarf logger properly
-	logger.Default().Debug("Successfully configured for in-cluster Kubernetes access")
+	// Get in-cluster config
+	inClusterConfig, err := rest.InClusterConfig()
+	if err != nil {
+		kubeconfigSetupErr = fmt.Errorf("failed to get in-cluster config: %w", err)
+		return kubeconfigSetupErr
+	}
+
+	// Read the service account token
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	token, err := os.ReadFile(tokenPath)
+	if err != nil {
+		kubeconfigSetupErr = fmt.Errorf("failed to read service account token: %w", err)
+		return kubeconfigSetupErr
+	}
+
+	// Read the CA certificate
+	caPath := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	caData, err := os.ReadFile(caPath)
+	if err != nil {
+		kubeconfigSetupErr = fmt.Errorf("failed to read CA certificate: %w", err)
+		return kubeconfigSetupErr
+	}
+
+	// Build a kubeconfig that looks like a local developer's config
+	kubeconfig := clientcmdapi.NewConfig()
+
+	// Create cluster entry
+	clusterName := "in-cluster"
+	kubeconfig.Clusters[clusterName] = &clientcmdapi.Cluster{
+		Server:                   inClusterConfig.Host,
+		CertificateAuthorityData: caData,
+	}
+
+	// Create auth info (user) entry using the service account token
+	userName := "provider-zarf"
+	kubeconfig.AuthInfos[userName] = &clientcmdapi.AuthInfo{
+		Token: string(token),
+	}
+
+	// Create context entry
+	contextName := "provider-zarf-context"
+	kubeconfig.Contexts[contextName] = &clientcmdapi.Context{
+		Cluster:  clusterName,
+		AuthInfo: userName,
+	}
+
+	// Set current context
+	kubeconfig.CurrentContext = contextName
+
+	// Write the kubeconfig to a file
+	if err := clientcmd.WriteToFile(*kubeconfig, kubeconfigPath); err != nil {
+		kubeconfigSetupErr = fmt.Errorf("failed to write kubeconfig file: %w", err)
+		return kubeconfigSetupErr
+	}
+
+	// Set KUBECONFIG environment variable to point to our generated file
+	if err := os.Setenv("KUBECONFIG", kubeconfigPath); err != nil {
+		kubeconfigSetupErr = fmt.Errorf("failed to set KUBECONFIG env var: %w", err)
+		return kubeconfigSetupErr
+	}
+
+	logger.Default().Debug("Successfully configured kubeconfig for in-cluster access",
+		"path", kubeconfigPath,
+		"server", inClusterConfig.Host)
+
 	return nil
 }
 
@@ -258,12 +343,14 @@ func New() Client {
 	}))
 
 	// CRITICAL: Configure for in-cluster Kubernetes access
-	// When running in a Kubernetes pod, clear KUBECONFIG to force client-go
-	// to use in-cluster configuration (service account token)
+	// Generate a kubeconfig file from in-cluster credentials so the Zarf library
+	// can use it via clientcmd loading rules (which expect a kubeconfig file)
 	if _, exists := os.LookupEnv("KUBERNETES_SERVICE_HOST"); exists {
-		// We're running in a pod, ensure KUBECONFIG is not set
-		_ = os.Unsetenv("KUBECONFIG")
-		slogLogger.Debug("Configured for in-cluster Kubernetes access")
+		if err := ensureInClusterConfig(); err != nil {
+			ctrlLogger.Error(err, "Failed to set up in-cluster kubeconfig, Zarf operations may fail")
+		} else {
+			slogLogger.Debug("Configured kubeconfig for in-cluster Kubernetes access")
+		}
 	}
 
 	return &client{}

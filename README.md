@@ -172,7 +172,7 @@ This allows for portable ZarfPackage definitions that work across different clus
 2. Run `make submodules` to initialize the build submodule
 3. Run `make reviewable` to run code generation, linters, and tests
 4. Run `make build` to build the provider binary
-5. Run `make docker-build` to build the container image
+5. Run `make build.all` to build container images and Crossplane packages for all platforms
 
 ### Running Tests
 

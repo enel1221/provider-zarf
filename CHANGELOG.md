@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-01-05
+
+### Fixed
+- **CRITICAL BUG**: Fixed "context deadline exceeded" when running in-cluster
+  - **Root Cause**: Zarf library uses `clientcmd.NewDefaultClientConfigLoadingRules()` which expects a kubeconfig file, but when running as a pod there's no kubeconfig file available
+  - **Symptom**: ZarfPackage deployments fail with "context deadline exceeded" after 30 seconds while "waiting for cluster connection"
+  - **Impact**: All ZarfPackage deployments failed when provider-zarf ran inside a Kubernetes cluster
+  - **Fix**: Generate a kubeconfig file at `/tmp/zarf-provider-kubeconfig` from in-cluster service account credentials (token + CA cert) and set `KUBECONFIG` environment variable
+  - **Technical Details**: Uses `clientcmdapi.Config` to build proper kubeconfig structure with cluster CA, server URL from `KUBERNETES_SERVICE_HOST/PORT`, and bearer token from service account
+
 ## [1.1.2] - 2025-01-XX
 
 ### Fixed
