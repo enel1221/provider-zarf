@@ -40,10 +40,10 @@ RELEASE_BRANCH_FILTER ?= main master release-% v%
 # ====================================================================================
 # Setup XPKG
 
-XPKG_REG_ORGS ?= ghcr.io/enel1221 xpkg.upbound.io/crossplane
+XPKG_REG_ORGS ?= ghcr.io/enel1221
 # NOTE(hasheddan): skip promoting on xpkg.upbound.io as channel tags are
 # inferred.
-XPKG_REG_ORGS_NO_PROMOTE ?= xpkg.upbound.io/crossplane
+XPKG_REG_ORGS_NO_PROMOTE ?=
 XPKGS = provider-zarf
 -include build/makelib/xpkg.mk
 
