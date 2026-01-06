@@ -582,11 +582,31 @@ func ensureClusterConnectivity(ctx context.Context, deployTimeout time.Duration,
 
 func executePackageDeployment(ctx context.Context, pkgLayout *layout.PackageLayout, deployOpts packager.DeployOptions, l *slog.Logger) error {
 	l.Info("zarfclient: starting packager.Deploy", "timeout", deployOpts.Timeout)
-	if _, err := packager.Deploy(ctx, pkgLayout, deployOpts); err != nil {
-		l.Error("zarfclient: packager.Deploy failed", "error", err, "timeout", deployOpts.Timeout)
-		return fmt.Errorf("deploy: %w", err)
+
+	// Run deployment in a goroutine so we can properly check context cancellation
+	// Zarf's internal wait loops may not respect context cancellation properly
+	type deployResult struct {
+		err error
 	}
-	return nil
+	resultCh := make(chan deployResult, 1)
+
+	go func() {
+		_, err := packager.Deploy(ctx, pkgLayout, deployOpts)
+		resultCh <- deployResult{err: err}
+	}()
+
+	// Wait for either deployment completion or context cancellation
+	select {
+	case <-ctx.Done():
+		l.Warn("zarfclient: context cancelled during deployment, aborting", "error", ctx.Err())
+		return fmt.Errorf("deployment cancelled: %w", ctx.Err())
+	case result := <-resultCh:
+		if result.err != nil {
+			l.Error("zarfclient: packager.Deploy failed", "error", result.err, "timeout", deployOpts.Timeout)
+			return fmt.Errorf("deploy: %w", result.err)
+		}
+		return nil
+	}
 }
 
 // Remove loads metadata for a deployed package and dispatches packager.Remove.

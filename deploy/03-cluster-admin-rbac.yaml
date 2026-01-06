@@ -15,5 +15,5 @@ roleRef:
   name: cluster-admin
 subjects:
 - kind: Group
-  name: system:serviceaccounts:crossplane-system
+  name: system:serviceaccounts:crossplane
   apiGroup: rbac.authorization.k8s.io
