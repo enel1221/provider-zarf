@@ -276,12 +276,9 @@ func setupKubeconfigFromInCluster() error {
 	kubeconfig := clientcmdapi.NewConfig()
 
 	// Create cluster entry
-	// Use kubernetes.default.svc DNS name instead of KUBERNETES_SERVICE_HOST
-	// which may be 0.0.0.0 in some cluster configurations
-	serverURL := "https://kubernetes.default.svc"
-	if port := os.Getenv("KUBERNETES_SERVICE_PORT"); port != "" {
-		serverURL = fmt.Sprintf("https://kubernetes.default.svc:%s", port)
-	}
+	// Use the server URL from rest.InClusterConfig() which correctly handles:
+	// - Standard clusters: uses KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT
+	serverURL := inClusterConfig.Host
 
 	clusterName := "in-cluster"
 	kubeconfig.Clusters[clusterName] = &clientcmdapi.Cluster{
